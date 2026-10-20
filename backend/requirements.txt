@@ -1,0 +1,20 @@
+# Network Traffic Predictor — Backend Dependencies
+
+# ── Phase 1: Core Telemetry & Live Capture ────────────────────────────────
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+scapy>=2.5,<3
+psutil>=6,<7
+pydantic>=2,<3
+websockets>=13,<15
+python-dotenv>=1,<2
+numpy>=2,<3
+
+# ── Testing & HTTP Client ────────────────────────────────────────────────
+pytest>=8,<9
+pytest-asyncio>=0.23,<1
+httpx>=0.27,<1
+
+# ── Phase 2: Analytics, ML, PCA & Anomaly Detection ──────────────────────
+pandas>=2,<3
+scikit-learn>=1.5,<2
