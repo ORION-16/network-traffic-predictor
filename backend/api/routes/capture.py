@@ -9,8 +9,13 @@ import logging
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
+from fastapi import Query
+from starlette.concurrency import run_in_threadpool
+
+from capture.packet_rates import capture_availability, probe_capture
 from capture.sniffer import start_capture, stop_capture
 from capture.state import CaptureStatus, capture_state
+from core.config import settings
 from schemas import CaptureStatusResponse, StartCaptureRequest
 
 router = APIRouter(prefix="/api/capture", tags=["capture"])
@@ -25,6 +30,7 @@ def _status_response() -> CaptureStatusResponse:
         total_packets=capture_state.aggregator.get_metrics().total_packets,
         total_bytes=capture_state.aggregator.get_metrics().total_bytes,
         error=capture_state.error,
+        demo_mode=settings.demo_mode,
     )
 
 
@@ -39,19 +45,10 @@ async def start(req: StartCaptureRequest) -> CaptureStatusResponse:
     """Start packet capture on the requested interface."""
     iface = req.interface.strip()
 
-    # Validate interface exists
-    try:
-        from scapy.arch import get_if_list
-
-        available = get_if_list()
-    except Exception:
-        available = []
-
-    if available and iface not in available:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Interface '{iface}' not found. Available: {', '.join(available)}",
-        )
+    if not settings.demo_mode:
+        availability = capture_availability(iface)
+        if not availability["available"]:
+            raise HTTPException(status_code=400, detail=availability["reason"])
 
     if capture_state.is_capturing:
         raise HTTPException(status_code=409, detail="Capture is already running.")
@@ -62,9 +59,10 @@ async def start(req: StartCaptureRequest) -> CaptureStatusResponse:
         raise HTTPException(status_code=409, detail=str(exc))
 
     # Give the worker a moment to transition to RUNNING or ERROR
-    import time
-    for _ in range(10):
-        time.sleep(0.1)
+    import asyncio
+
+    for _ in range(30):
+        await asyncio.sleep(0.1)
         if capture_state.status in (CaptureStatus.RUNNING, CaptureStatus.ERROR):
             break
 
@@ -73,6 +71,35 @@ async def start(req: StartCaptureRequest) -> CaptureStatusResponse:
         raise HTTPException(status_code=500, detail=resp.error or "Capture failed to start")
 
     return resp
+
+
+@router.get("/availability")
+async def availability(interface: str | None = None) -> dict:
+    """Whether Scapy capture can be attempted on the monitored interface. Starts nothing."""
+    from monitoring.collector import monitoring_collector
+
+    name = (interface or monitoring_collector.selected_name() or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="No interface is selected.")
+    result = await run_in_threadpool(capture_availability, name)
+    result["authoritative_source"] = "psutil.net_io_counters"
+    result["role"] = "diagnostic comparison only; packet bytes are never added to counter bytes"
+    return result
+
+
+@router.post("/compare")
+async def compare(seconds: float = Query(default=5.0, ge=1.0, le=15.0)) -> dict:
+    """Capture metadata for a bounded window and compare with OS counters over the same window."""
+    from monitoring.collector import monitoring_collector
+
+    if capture_state.is_capturing or capture_state.has_worker():
+        raise HTTPException(status_code=409, detail="Stop the running capture before a comparison.")
+    name = monitoring_collector.selected_name()
+    if not name:
+        raise HTTPException(status_code=400, detail="No interface is selected.")
+    result = await run_in_threadpool(probe_capture, name, seconds)
+    result["interface"] = name
+    return result
 
 
 @router.post("/stop", response_model=CaptureStatusResponse)

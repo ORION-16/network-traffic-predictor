@@ -27,7 +27,7 @@ export default function ErrorAlert({ error, onDismiss }) {
           </div>
           <div>
             <h4 className="text-sm font-bold text-white flex items-center gap-2">
-              {isPermission ? 'Elevated Permissions Required' : 'Capture Error Encountered'}
+              {isPermission ? 'Elevated permissions required' : 'Monitoring problem'}
             </h4>
             <p className="text-xs text-rose-300/90 mt-1 leading-relaxed">{error}</p>
 

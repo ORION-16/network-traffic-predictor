@@ -1,8 +1,29 @@
 # Network Traffic Predictor — Permissions & Security Guide
 
-Packet sniffing requires raw packet access at Layer 2/3 of the network stack. Operating systems restrict raw packet capture to prevent unprivileged processes from snooping on user traffic.
+## Interface counters and probes
 
-This document describes the minimum operating system permissions required to run the Scapy capture worker on macOS and Linux.
+Live Mbps does not read packet payloads. `psutil.net_io_counters` reads OS interface totals. On the Windows machine used for verification, that call succeeded as a normal user. No administrator shell was required for collection, SQLite, forecasting, or the dashboard.
+
+The latency probe runs `ping` against `LATENCY_PROBE_TARGET` (default `1.1.1.1`). The target is configured on the server. Clients cannot supply a host, a count above 5, or a shell string. ICMP may be blocked by policy; the API then returns the probe failure instead of a zero-loss result.
+
+Windows adapter kind, media, and NIC speed come from a fixed `Get-NetAdapter` command. The interface name is not interpolated into that command. If the command fails, interfaces still list from psutil and the kind fields say the adapter metadata is unavailable.
+
+The API does not return addresses or MAC addresses. Documentation and the real-network result file omit them as well.
+
+`DEMO_MODE` can synthesize packets for the optional sniffer. It does not synthesize counter observations. Leave it `false`.
+
+## Packet capture
+
+Packet sniffing requires raw packet access at Layer 2/3. That privilege is separate from counter monitoring, and capture is optional. The stored throughput always comes from OS counters.
+
+### Windows (verified on Windows 11)
+
+- **Npcap.** Scapy needs [Npcap](https://npcap.com). On the verification machine, the Npcap service was running, `C:\Windows\System32\Npcap` existed, and capture worked from a normal user shell. Npcap was installed without "Restrict Npcap driver's access to Administrators only". With that option on, capture needs an elevated shell, and the API returns `permission_denied` instead of a rate.
+- **Interface names.** Use the Windows interface name, for example `Wi-Fi` or `Ethernet`. The backend maps it to Scapy's Npcap device. `GET /api/capture/availability` reports whether capture can be attempted and why not. It starts nothing.
+- **Accuracy.** With promiscuous mode off, capture matched the counters within about 2% at idle. During a 20 MB download it saw about 55% of the received packets, because the Python callback drops packets under load. Use the result as a diagnostic, not as a throughput source.
+- **Without Npcap.** If Npcap is missing, availability says so. Counter monitoring, forecasting, and alerts are unaffected.
+
+The macOS and Linux steps below are the original project guidance and were not re-tested.
 
 ---
 

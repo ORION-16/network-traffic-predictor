@@ -1,291 +1,388 @@
-import React, { useState, useEffect, useCallback, useTransition } from 'react';
-import Navbar from '../components/Navbar';
-import MetricCard from '../components/MetricCard';
-import InterfaceSelector from '../components/InterfaceSelector';
-import Controls from '../components/Controls';
-import TrafficChart from '../charts/TrafficChart';
-import ProtocolChart from '../charts/ProtocolChart';
-import PacketTable from '../components/PacketTable';
-import ErrorAlert from '../components/ErrorAlert';
-import { useCaptureSocket } from '../hooks/useCaptureSocket';
+import { useCallback, useEffect, useState } from "react";
+import ErrorAlert from "../components/ErrorAlert";
+import AlertPanel from "../components/AlertPanel";
+import DiagnosticsPanel from "../components/DiagnosticsPanel";
+import ThroughputChart from "../charts/ThroughputChart";
+import { useMonitoring } from "../hooks/useMonitoring";
 import {
-  fetchInterfaces,
-  fetchCaptureStatus,
-  startCapture,
-  stopCapture,
-  getExportCsvUrl,
-} from '../services/api';
+  clearCapacity,
+  clearProfileThresholds,
+  fetchMonitoringInterfaces,
+  saveForecastHorizon,
+  saveProfileThresholds,
+  saveThresholds,
+  selectAutoInterface,
+  selectMonitoringInterface,
+} from "../services/api";
+import { alertCopy, displayMbps, formatTimestamp, nextAlertLatch, riseWarning, trafficOutlook } from "../lib/monitoringView";
 
-/**
- * Format raw bytes into human readable B / KB / MB / GB.
- */
-function formatBytes(bytes) {
-  if (bytes === 0 || !bytes) return { value: '0', unit: 'B' };
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return {
-    value: parseFloat((bytes / Math.pow(k, i)).toFixed(2)).toString(),
-    unit: sizes[i],
-  };
+const FORECAST_DEFAULTS = {
+  method: "exponential_smoothing",
+  window: 12,
+  alpha: 0.3,
+};
+const WINDOWS = [
+  { seconds: 300, label: "5 min" },
+  { seconds: 900, label: "15 min" },
+  { seconds: 3600, label: "1 hour" },
+];
+const SOURCE_TEXT = { user: "you entered", capacity: "saved capacity", global: "all interfaces", profile: "this interface only", unset: "not set" };
+
+function parseThreshold(text) {
+  if (text.trim() === "") return { value: undefined };
+  const value = Number(text);
+  if (!Number.isFinite(value) || value <= 0) return { error: "Thresholds must be numbers greater than 0 Mbps." };
+  if (value > 1_000_000) return { error: "Thresholds must be at most 1,000,000 Mbps." };
+  return { value };
 }
 
-/**
- * Main dashboard page for Phase 1 Network Traffic Predictor.
- */
+function Stat({ label, value, id, tone = "text-white" }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-xs text-slate-500">{label}</dt>
+      <dd className={`text-sm font-medium truncate ${tone}`} id={id} title={typeof value === "string" ? value : undefined}>{value}</dd>
+    </div>
+  );
+}
+
 export default function Dashboard() {
+  const [horizon, setHorizon] = useState(300);
+  const [historySeconds, setHistorySeconds] = useState(900);
   const [interfaces, setInterfaces] = useState([]);
-  const [selectedInterface, setSelectedInterface] = useState('');
-  const [loadingInterfaces, setLoadingInterfaces] = useState(true);
-  const [interfaceError, setInterfaceError] = useState(null);
+  const [actionError, setActionError] = useState(null);
+  const [downloadInput, setDownloadInput] = useState("");
+  const [uploadInput, setUploadInput] = useState("");
+  const [profileOnly, setProfileOnly] = useState(false);
+  const [savedNote, setSavedNote] = useState(null);
+  const [latch, setLatch] = useState(null);
+  const [notificationPermission, setNotificationPermission] = useState(() => (
+    typeof Notification === "undefined" ? "unsupported" : Notification.permission
+  ));
+  const { data, error: monitoringError, loading, reload } = useMonitoring({ ...FORECAST_DEFAULTS, horizon, historySeconds });
 
-  const [isCapturing, setIsCapturing] = useState(false);
-  const [captureError, setCaptureError] = useState(null);
-  const [actionLoading, setActionLoading] = useState(false);
-  const [isRefreshing, setIsRefreshing] = useState(false);
-
-  // Hook for live WebSocket packet updates
-  const {
-    connectionState,
-    metrics,
-    recentPackets,
-    trafficSeries,
-    wsError,
-    resetData,
-  } = useCaptureSocket(isCapturing);
-
-  // Combine errors for banner display
-  const activeError = captureError || wsError;
-
-  // Fetch interface list
   const loadInterfaces = useCallback(async () => {
     try {
-      setLoadingInterfaces(true);
-      setInterfaceError(null);
-      const data = await fetchInterfaces();
-      const list = data.interfaces || [];
-      setInterfaces(list);
-
-      // Auto-select first active or loopback interface if none selected
-      if (!selectedInterface && list.length > 0) {
-        const preferred = list.find((i) => i.is_up && !i.is_loopback) || list[0];
-        setSelectedInterface(preferred.name);
-      }
+      const payload = await fetchMonitoringInterfaces();
+      setInterfaces(payload.interfaces || []);
     } catch (err) {
-      setInterfaceError(err.message || 'Failed to load network interfaces');
-    } finally {
-      setLoadingInterfaces(false);
-      setIsRefreshing(false);
+      setActionError(err.message || "Could not list network interfaces");
     }
-  }, [selectedInterface]);
-
-  // Initial load: interfaces and initial capture status
-  useEffect(() => {
-    loadInterfaces();
-
-    // Check initial capture status from backend
-    fetchCaptureStatus()
-      .then((status) => {
-        setIsCapturing(status.is_capturing);
-        if (status.interface) {
-          setSelectedInterface(status.interface);
-        }
-        if (status.error) {
-          setCaptureError(status.error);
-        }
-      })
-      .catch((err) => {
-        console.warn('Initial status fetch warning:', err);
-      });
   }, []);
 
-  const handleRefreshInterfaces = () => {
-    setIsRefreshing(true);
+  useEffect(() => {
     loadInterfaces();
+  }, [loadInterfaces]);
+
+  useEffect(() => {
+    const alert = data?.rise_alert;
+    setLatch((previous) => nextAlertLatch(previous, {
+      fresh: data?.collection?.freshness === "fresh",
+      quality: data?.current?.quality,
+      exceeded: alert?.state === "threshold_exceeded",
+      rising: Boolean(alert?.rising),
+      insufficient: alert?.state === "insufficient_history",
+      advanceEnabled: Boolean(alert?.advance?.enabled),
+      advancePredicts: Boolean(alert?.advance?.predicts),
+    }, Date.now()));
+  }, [data]);
+
+  useEffect(() => {
+    if (!latch?.notify || notificationPermission !== "granted" || typeof Notification === "undefined") return;
+    const copy = alertCopy(data?.rise_alert, latch.state);
+    try {
+      new Notification(copy.label, { body: copy.explanation });
+    } catch {
+      // The panel is the alert of record when the browser refuses the notice.
+    }
+    // Generation changes only when an alert begins.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [latch?.generation, notificationPermission]);
+
+  const collection = data?.collection;
+  const current = data?.current;
+  const thresholds = data?.thresholds;
+  const outlook = trafficOutlook({
+    collection,
+    current,
+    history: data?.history,
+    forecast: data?.forecast,
+    capacity: data?.capacity,
+    evaluation: data?.evaluation,
+    ledger: data?.forecast_ledger,
+    horizonSeconds: horizon,
+  });
+  const dataset = data?.dataset;
+  const measuredNow = current?.quality === "ok" && collection?.freshness === "fresh";
+  const downloadNow = measuredNow ? `${displayMbps(current?.rx_mbps)} Mbps` : "unavailable";
+  const uploadNow = measuredNow ? `${displayMbps(current?.tx_mbps)} Mbps` : "unavailable";
+  const statusError = monitoringError || collection?.error || actionError;
+  const alertView = alertCopy(data?.rise_alert, latch?.state);
+  const selected = collection?.selected_interface;
+  const selectedRecord = interfaces.find((item) => item.name === selected) || data?.interface;
+  const mode = collection?.interface_mode || data?.profiles?.mode || "manual";
+  const profile = data?.profiles?.items?.find((item) => item.selected);
+  const freshnessTone = collection?.freshness === "fresh" ? "text-emerald-200" : collection?.freshness ? "text-amber-200" : "text-slate-300";
+
+  const allowNotifications = async () => {
+    if (typeof Notification === "undefined") {
+      setNotificationPermission("unsupported");
+      return;
+    }
+    setNotificationPermission(await Notification.requestPermission());
   };
 
-  // Start capture handler
-  const handleStart = async () => {
-    if (!selectedInterface) return;
+  const onInterface = async (value) => {
     try {
-      setActionLoading(true);
-      setCaptureError(null);
-      const res = await startCapture(selectedInterface);
-      setIsCapturing(res.is_capturing);
-      resetData();
+      if (value === "__auto__") await selectAutoInterface();
+      else await selectMonitoringInterface(value);
+      setActionError(null);
+      await Promise.all([reload(), loadInterfaces()]);
     } catch (err) {
-      setCaptureError(err.message || 'Failed to initiate packet capture');
-    } finally {
-      setActionLoading(false);
+      setActionError(err.message || "Could not select that interface");
     }
   };
 
-  // Stop capture handler
-  const handleStop = async () => {
+  const onSaveThresholds = async (event) => {
+    event.preventDefault();
+    const down = parseThreshold(downloadInput);
+    const up = parseThreshold(uploadInput);
+    const problem = down.error || up.error;
+    if (problem) {
+      setActionError(problem);
+      return;
+    }
+    const body = {};
+    if (down.value !== undefined) body.download_threshold_mbps = down.value;
+    if (up.value !== undefined) body.upload_threshold_mbps = up.value;
+    if (!Object.keys(body).length) {
+      setActionError("Enter a download or upload threshold, or use Clear.");
+      return;
+    }
     try {
-      setActionLoading(true);
-      const res = await stopCapture();
-      setIsCapturing(res.is_capturing);
+      if (profileOnly && selected) await saveProfileThresholds(selected, body);
+      else await saveThresholds(body);
+      setActionError(null);
+      setDownloadInput("");
+      setUploadInput("");
+      setSavedNote(profileOnly && selected ? `Saved for ${selected} only.` : "Saved for all interfaces.");
+      await reload();
     } catch (err) {
-      setCaptureError(err.message || 'Failed to stop capture');
-    } finally {
-      setActionLoading(false);
+      setActionError(err.message || "Could not save thresholds");
     }
   };
 
-  // CSV export handler
-  const handleExportCsv = () => {
-    const url = getExportCsvUrl();
-    window.open(url, '_blank');
+  const onClearThresholds = async () => {
+    try {
+      if (profileOnly && selected) {
+        await clearProfileThresholds(selected);
+        setSavedNote(`Cleared the ${selected} override. Global values apply.`);
+      } else {
+        await saveThresholds({ download_threshold_mbps: null, upload_threshold_mbps: null });
+        await clearCapacity();
+        setSavedNote("Cleared the download and upload thresholds, including the older single capacity value.");
+      }
+      setActionError(null);
+      await reload();
+    } catch (err) {
+      setActionError(err.message || "Could not clear thresholds");
+    }
   };
-
-  const formattedBytes = formatBytes(metrics.total_bytes);
-  const formattedThroughput = formatBytes(metrics.throughput);
 
   return (
-    <div className="min-h-screen bg-[#070b14] text-slate-100 flex flex-col font-sans">
-      <Navbar
-        selectedInterface={selectedInterface}
-        connectionState={connectionState}
-        isCapturing={isCapturing}
-        error={activeError}
-        onRefreshInterfaces={handleRefreshInterfaces}
-        isRefreshing={isRefreshing}
-      />
+    <div className="min-h-screen bg-[#070b14] text-slate-100">
+      <header className="border-b border-slate-800/80 bg-slate-950/70">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-2">
+          <div>
+            <h1 className="text-lg font-semibold text-white">Network traffic</h1>
+            <p className="text-sm text-slate-400">One interface on this computer. Not the router or other devices on the network.</p>
+          </div>
+          <p className="text-xs text-slate-500" aria-live="polite">
+            {loading && !data ? "Connecting to the backend…" : collection?.status || "unavailable"}
+            {collection?.freshness ? ` · ${collection.freshness}` : ""}
+          </p>
+        </div>
+      </header>
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
-        {/* Error Alert Banner */}
-        <ErrorAlert error={activeError} onDismiss={() => setCaptureError(null)} />
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+        <ErrorAlert error={statusError} onDismiss={() => setActionError(null)} />
 
-        {/* Dashboard Control Bar */}
-        <div className="glass-panel p-4 sm:p-5 rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="flex flex-col sm:flex-row sm:items-center gap-4">
-            <InterfaceSelector
-              interfaces={interfaces}
-              selectedInterface={selectedInterface}
-              onSelect={setSelectedInterface}
-              isLoading={loadingInterfaces}
-              isCapturing={isCapturing}
-              error={interfaceError}
-            />
+        <section className="glass-panel rounded-2xl p-4 sm:p-5" id="overview" aria-label="Overview">
+          <dl className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+            <Stat label="Collector" value={`${collection?.status || "unavailable"} · ${collection?.freshness || "no data"}`} id="overview-health" tone={freshnessTone} />
+            <Stat label="Source" value={collection?.source || "unavailable"} id="overview-source" />
+            <Stat label="Interface" value={selected ? `${selected}${selectedRecord?.kind ? ` · ${selectedRecord.kind}` : ""}` : "none"} id="overview-interface" />
+            <Stat label="Profile" value={profile ? `${profile.name} · ${mode}` : mode} id="overview-profile" />
+            <Stat label="Download" value={downloadNow} id="overview-download" />
+            <Stat label="Upload" value={uploadNow} id="overview-upload" />
+            <Stat label="Alert" value={alertView.label} id="overview-alert" tone={alertView.label === "Normal" ? "text-emerald-200" : alertView.label === "Threshold exceeded" ? "text-rose-200" : "text-amber-100"} />
+            <Stat label="Packet capture" value={collection?.packet_capture?.is_capturing ? "running (diagnostic)" : "off · counters only"} id="overview-capture" />
+          </dl>
+        </section>
 
-            {/* Quick Helper badge for interface selection */}
-            {selectedInterface && (
-              <span className="hidden lg:inline-flex text-[11px] text-slate-400 bg-slate-900/60 px-3 py-1 rounded-xl border border-slate-800">
-                Packets will be captured from <strong className="text-slate-200 ml-1">{selectedInterface}</strong>
+        <section className="glass-panel rounded-2xl p-4 sm:p-5 space-y-4" id="live-traffic" aria-labelledby="live-heading">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h2 id="live-heading" className="text-base font-semibold text-white">Live network traffic</h2>
+              <p className="text-sm text-slate-400">Download and upload in decimal Mbps from OS byte counters. Near zero is normal when nothing is transferring. Gaps stay blank.</p>
+            </div>
+            <label className="text-sm text-slate-300 whitespace-nowrap">
+              Window
+              <select
+                className="ml-2 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1"
+                value={historySeconds}
+                onChange={(event) => setHistorySeconds(Number(event.target.value))}
+                aria-label="Chart time window"
+              >
+                {WINDOWS.map((item) => <option key={item.seconds} value={item.seconds}>{item.label}</option>)}
+              </select>
+            </label>
+          </div>
+          <ThroughputChart
+            history={data?.history || []}
+            forecast={data?.forecast}
+            thresholds={thresholds}
+            transitions={data?.transitions || []}
+            downsampled={Boolean(data?.history_resolution?.downsampled)}
+            sampleInterval={collection?.sample_interval_seconds || 1}
+            windowStart={data?.collected_at ? data.collected_at - historySeconds : null}
+          />
+          <p className="text-xs text-slate-500" id="history-summary">
+            {selected || "No interface"} · every {collection?.sample_interval_seconds ?? "—"}s · last sample {formatTimestamp(current?.sampled_at)}
+            {current?.quality ? ` · ${current.quality}` : ""}
+            {" · "}
+            {dataset?.valid_observations
+              ? `${dataset.valid_observations} valid readings over ${(dataset.duration_seconds / 60).toFixed(1)} min`
+              : "Collecting data"}
+          </p>
+        </section>
+
+        <AlertPanel
+          alert={data?.rise_alert}
+          view={alertView}
+          latchSince={latch?.since}
+          notificationPermission={notificationPermission}
+          onAllowNotifications={allowNotifications}
+          events={data?.alert_events || []}
+        />
+
+        <section className="glass-panel rounded-2xl p-4 sm:p-5 space-y-4" id="traffic-forecast" aria-labelledby="forecast-heading">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 id="forecast-heading" className="text-base font-semibold text-white">Traffic forecast</h2>
+              <p className="text-sm text-slate-400">Exponential smoothing, checked against persistence and a moving average. The dashed line is that level from the latest sample forward. It lags a sudden jump and does not predict when one will start.</p>
+            </div>
+            <label className="text-sm text-slate-300 whitespace-nowrap">
+              Horizon
+              <select
+                className="ml-2 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1"
+                value={horizon}
+                onChange={(event) => {
+                  const next = Number(event.target.value);
+                  setHorizon(next);
+                  saveForecastHorizon(next).catch((err) => setActionError(err.message || "Could not save the forecast horizon"));
+                }}
+                aria-label="Forecast horizon"
+              >
+                <option value={60}>1 minute</option>
+                <option value={300}>5 minutes</option>
+                <option value={900}>15 minutes</option>
+              </select>
+            </label>
+          </div>
+          <p className="text-sm text-slate-100" id="trend-summary">{outlook.trend}</p>
+          {riseWarning(data?.forecast?.receive?.recent_rise) && (
+            <p className="text-sm text-amber-200" id="burst-warning">{riseWarning(data.forecast.receive.recent_rise)}</p>
+          )}
+          <p className="text-sm text-slate-300" id="overload-summary">{outlook.overload}</p>
+          <p className="text-xs text-slate-500" id="accuracy-summary">{outlook.accuracy}</p>
+        </section>
+
+        <section className="glass-panel rounded-2xl p-4 sm:p-5 space-y-4" id="settings" aria-labelledby="settings-heading">
+          <h2 id="settings-heading" className="text-base font-semibold text-white">Interface and thresholds</h2>
+          <div className="grid gap-4 md:grid-cols-2">
+            <label className="text-sm text-slate-300 block">
+              Interface
+              <select
+                className="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5"
+                value={mode === "auto" ? "__auto__" : selected || ""}
+                onChange={(event) => onInterface(event.target.value)}
+                aria-label="Monitoring interface"
+              >
+                <option value="__auto__">Automatic: follow the active route{mode === "auto" && selected ? ` (${selected})` : ""}</option>
+                {(interfaces.length ? interfaces : [{ name: selected || "" }]).map((item) => (
+                  <option key={item.name} value={item.name}>
+                    {item.name}
+                    {item.is_default_route ? " · active path" : ""}
+                    {item.kind ? ` · ${item.kind}` : ""}
+                    {item.is_up === false ? " · down" : ""}
+                  </option>
+                ))}
+              </select>
+              <span className="mt-1 block text-xs text-slate-500">
+                Switching re-baselines the counters, marks the change on the chart, and keeps each interface’s history and alerts separate. No reload is needed.
               </span>
-            )}
-          </div>
+            </label>
 
-          <Controls
-            isCapturing={isCapturing}
-            onStart={handleStart}
-            onStop={handleStop}
-            onExportCsv={handleExportCsv}
-            onReset={resetData}
-            selectedInterface={selectedInterface}
-            isLoadingAction={actionLoading}
-            hasPackets={recentPackets.length > 0 || metrics.total_packets > 0}
-          />
-        </div>
-
-        {/* Metrics Grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <MetricCard
-            label="Total Packets"
-            value={metrics.total_packets.toLocaleString()}
-            unit="pkts"
-            color="indigo"
-            icon={
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-              </svg>
-            }
-          />
-
-          <MetricCard
-            label="Total Volume"
-            value={formattedBytes.value}
-            unit={formattedBytes.unit}
-            color="cyan"
-            icon={
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 7v10c0 2 1 3 3 3h10c2 0 3-1 3-3V7c0-2-1-3-3-3H7C5 4 4 5 4 7z" />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-3-3v6" />
-              </svg>
-            }
-          />
-
-          <MetricCard
-            label="Packet Rate"
-            value={metrics.packet_rate.toFixed(1)}
-            unit="pkts/s"
-            color="emerald"
-            icon={
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
-              </svg>
-            }
-          />
-
-          <MetricCard
-            label="Throughput"
-            value={formattedThroughput.value}
-            unit={`${formattedThroughput.unit}/s`}
-            color="amber"
-            icon={
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-              </svg>
-            }
-          />
-        </div>
-
-        {/* Charts Section: 2 Columns on desktop */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Traffic over time (spans 2 columns) */}
-          <div className="lg:col-span-2 glass-panel p-5 rounded-2xl flex flex-col justify-between" id="traffic-time-chart">
-            <div className="flex items-center justify-between mb-2">
-              <div>
-                <h3 className="text-sm font-semibold tracking-wide text-white uppercase">
-                  Traffic Intensity Over Time
-                </h3>
-                <p className="text-xs text-slate-400">
-                  Dual-axis time series of packet frequency & throughput
-                </p>
+            <form onSubmit={onSaveThresholds} className="text-sm text-slate-300 space-y-2" aria-describedby="threshold-help">
+              <div className="grid grid-cols-2 gap-2">
+                <label className="block">
+                  Download threshold (Mbps)
+                  <input
+                    className="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5"
+                    inputMode="decimal"
+                    placeholder={thresholds?.receive != null ? String(thresholds.receive) : "Not set"}
+                    value={downloadInput}
+                    onChange={(event) => setDownloadInput(event.target.value)}
+                    aria-label="Download threshold Mbps"
+                    id="download-threshold-input"
+                  />
+                </label>
+                <label className="block">
+                  Upload threshold (Mbps)
+                  <input
+                    className="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5"
+                    inputMode="decimal"
+                    placeholder={thresholds?.transmit != null ? String(thresholds.transmit) : "Not set"}
+                    value={uploadInput}
+                    onChange={(event) => setUploadInput(event.target.value)}
+                    aria-label="Upload threshold Mbps"
+                    id="upload-threshold-input"
+                  />
+                </label>
               </div>
-              {isCapturing && (
-                <span className="flex items-center gap-1.5 text-[10px] text-emerald-400 font-mono">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
-                  Streaming 1Hz
-                </span>
-              )}
-            </div>
-            <TrafficChart trafficSeries={trafficSeries} />
-          </div>
-
-          {/* Protocol Distribution Donut (spans 1 column) */}
-          <div className="glass-panel p-5 rounded-2xl flex flex-col justify-between" id="protocol-donut-chart">
-            <div className="mb-2">
-              <h3 className="text-sm font-semibold tracking-wide text-white uppercase">
-                Protocol Composition
-              </h3>
-              <p className="text-xs text-slate-400">
-                Layer 3/4 distribution of observed packets
+              <label className="flex items-center gap-2 text-xs text-slate-400">
+                <input type="checkbox" checked={profileOnly} onChange={(event) => setProfileOnly(event.target.checked)} disabled={!selected} />
+                Apply only to {selected || "this interface"}
+              </label>
+              <div className="flex gap-2">
+                <button type="submit" className="px-3 py-1.5 rounded-lg bg-indigo-600 text-white">Save</button>
+                <button type="button" className="px-3 py-1.5 rounded-lg border border-slate-700" onClick={onClearThresholds}>Clear</button>
+              </div>
+              <p className="text-xs text-slate-500" id="threshold-help">
+                Current: download {thresholds?.receive != null ? `${thresholds.receive} Mbps (${SOURCE_TEXT[thresholds.sources?.receive]})` : "not set"},
+                upload {thresholds?.transmit != null ? `${thresholds.transmit} Mbps (${SOURCE_TEXT[thresholds.sources?.transmit]})` : "not set"}.
+                These are test values you choose, not measured internet capacity, and adapter link speed is never used. {savedNote}
               </p>
-            </div>
-            <ProtocolChart protocolDistribution={metrics.protocol_distribution} />
+            </form>
           </div>
-        </div>
+          {data?.profiles?.items?.length > 1 && (
+            <details className="text-xs text-slate-400">
+              <summary className="cursor-pointer text-slate-300">Interface profiles ({data.profiles.items.length})</summary>
+              <ul className="mt-2 space-y-1" id="profile-list">
+                {data.profiles.items.map((item) => (
+                  <li key={item.name}>
+                    {item.name}{item.selected ? " (monitoring)" : ""}: {item.valid_observations} valid readings, last {formatTimestamp(item.latest_at)}
+                    {item.has_own_thresholds ? " · own thresholds" : ""}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-2">{data.profiles.note}</p>
+            </details>
+          )}
+        </section>
 
-        {/* Recent Packets Feed Table */}
-        <PacketTable packets={recentPackets} isCapturing={isCapturing} />
+        <DiagnosticsPanel />
       </main>
-
-      {/* Footer */}
-      <footer className="border-t border-slate-800/60 py-4 mt-8 bg-slate-950/40 text-center text-xs text-slate-500">
-        <p>Network Traffic Predictor • Phase 1 Live Telemetry Module • Safe Header-Only Capture</p>
-      </footer>
     </div>
   );
 }

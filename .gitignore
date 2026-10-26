@@ -30,3 +30,10 @@ dist/
 
 # Logs
 *.log
+
+# Local counter history (created at runtime)
+backend/data/
+
+# Test caches
+.pytest_cache/
+**/.pytest_cache/
