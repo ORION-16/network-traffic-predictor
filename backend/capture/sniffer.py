@@ -12,7 +12,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
-from capture.state import capture_state
+from capture.state import CaptureStatus, capture_state
 from core.config import settings
 from processing.parser import parse_packet
 from schemas import PacketMeta
@@ -91,16 +91,28 @@ def _capture_worker(interface: str) -> None:
     try:
         from scapy.all import sniff as scapy_sniff
 
-        capture_state.mark_running()
-        logger.info("Live Scapy capture started on %s", interface)
+        from capture.packet_rates import resolve_scapy_interface
 
-        scapy_sniff(
-            iface=interface,
-            prn=_sniff_callback,
-            stop_filter=_should_stop,
-            store=False,  # never keep packets in Scapy's unbounded memory
-            count=0,
-        )
+        try:
+            iface = resolve_scapy_interface(interface)
+        except LookupError:
+            iface = interface
+
+        def _opened() -> None:
+            if capture_state.status != CaptureStatus.RUNNING:
+                capture_state.mark_running()
+                logger.info("Live Scapy capture started on %s", interface)
+
+        # Short timeouts let a stop request end the worker even when no packet arrives.
+        while not capture_state.stop_event.is_set():
+            scapy_sniff(
+                iface=iface,
+                prn=_sniff_callback,
+                stop_filter=_should_stop,
+                store=False,  # never keep packets in Scapy's unbounded memory
+                timeout=1.0,
+                started_callback=_opened,
+            )
     except PermissionError:
         msg = (
             f"Permission denied capturing on '{interface}'. "
@@ -122,7 +134,9 @@ def _capture_worker(interface: str) -> None:
         capture_state.mark_error(msg)
         return
     finally:
-        if capture_state.status != capture_state.status.ERROR:
+        # Compare against the enum type. Enum members do not carry sibling names,
+        # so capture_state.status.ERROR raises AttributeError and would skip cleanup.
+        if capture_state.status != CaptureStatus.ERROR:
             capture_state.mark_stopped()
         logger.info("Capture worker for %s exited", interface)
 

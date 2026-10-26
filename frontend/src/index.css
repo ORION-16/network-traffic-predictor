@@ -18,16 +18,13 @@
 
 /* Glassmorphism card utility */
 .glass-panel {
-  background: var(--card-bg);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  background: rgba(15, 23, 42, 0.96);
   border: 1px solid var(--border-color);
   box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
 }
 
 .glass-panel-glow {
-  background: var(--card-bg);
-  backdrop-filter: blur(12px);
+  background: rgba(15, 23, 42, 0.96);
   border: 1px solid rgba(99, 102, 241, 0.25);
   box-shadow: 0 0 25px -5px rgba(99, 102, 241, 0.15);
 }

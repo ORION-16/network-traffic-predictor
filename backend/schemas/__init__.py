@@ -12,6 +12,14 @@ class InterfaceInfo(BaseModel):
     description: str = ""
     is_up: bool = False
     is_loopback: bool = False
+    kind: str = "unknown"
+    kind_source: str = "unknown"
+    medium: str = "unknown"
+    is_default_route: bool = False
+    reported_link_speed_mbps: float | None = None
+    link_speed_status: str = "unknown"
+    os_link_speed_text: str | None = None
+    reported_duplex: str = "unknown"
 
 
 class InterfaceListResponse(BaseModel):
@@ -31,6 +39,7 @@ class CaptureStatusResponse(BaseModel):
     total_packets: int = 0
     total_bytes: int = 0
     error: str | None = None
+    demo_mode: bool = False
 
 
 # ── Packet metadata ──────────────────────────────────────────────────
