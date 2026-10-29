@@ -27,6 +27,13 @@ DEFAULT_CONFIG: dict = {
     "upload_threshold_mbps": None,
     "profiles": {},
     "interface_mode": "manual",
+    "alert_clear_ratio": 0.9,
+    "alert_clear_samples": 3,
+    "alert_cooldown_seconds": 30.0,
+    "baseline_anomaly_enabled": False,
+    "baseline_multiplier": 3.0,
+    "baseline_floor_mbps": 5.0,
+    "baseline_margin_mbps": 5.0,
 }
 
 
@@ -147,6 +154,9 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_transitions_at ON transitions(at);
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(alert_events)")}
+            if "baseline_mbps" not in columns:
+                conn.execute("ALTER TABLE alert_events ADD COLUMN baseline_mbps REAL")
 
     def get_config(self) -> dict:
         with self._lock, self.connect() as conn:
@@ -522,15 +532,16 @@ class Store:
         started_at: float,
         threshold_mbps: float | None,
         trigger_mbps: float | None,
+        baseline_mbps: float | None = None,
     ) -> int:
         with self._lock, self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO alert_events(interface_name, direction, kind, started_at,
-                    threshold_mbps, trigger_mbps, peak_mbps)
-                VALUES(?, ?, ?, ?, ?, ?, ?)
+                    threshold_mbps, trigger_mbps, peak_mbps, baseline_mbps)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (interface_name, direction, kind, started_at, threshold_mbps, trigger_mbps, trigger_mbps),
+                (interface_name, direction, kind, started_at, threshold_mbps, trigger_mbps, trigger_mbps, baseline_mbps),
             )
             return int(cursor.lastrowid)
 
@@ -578,11 +589,25 @@ class Store:
             params.extend([start, start])
         sql += " ORDER BY started_at DESC LIMIT ?"
         params.append(limit)
+        now = time.time()
         with self._lock, self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
+        return [_event_dict(row, now) for row in rows]
+
+    def open_alert_events(self, interface_name: str, kind: str) -> list[dict]:
+        """Episodes that have not been recovered or otherwise closed."""
+        with self._lock, self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM alert_events
+                WHERE interface_name = ? AND kind = ? AND ended_at IS NULL AND end_reason IS NULL
+                ORDER BY started_at ASC
+                """,
+                (interface_name, kind),
+            ).fetchall()
         return [_row_dict(row) for row in rows]
 
-    def alert_history_summary(self, interface_name: str) -> dict:
+    def alert_history_summary(self, interface_name: str, kind: str = "threshold_exceeded") -> dict:
         """Last start, last observed recovery, and episode count per direction."""
         summary: dict = {}
         with self._lock, self.connect() as conn:
@@ -591,9 +616,9 @@ class Store:
                     """
                     SELECT COUNT(*) AS episodes, MAX(started_at) AS last_alert_at, MAX(ended_at) AS last_recovery_at
                     FROM alert_events
-                    WHERE interface_name = ? AND direction = ? AND kind = 'threshold_exceeded'
+                    WHERE interface_name = ? AND direction = ? AND kind = ?
                     """,
-                    (interface_name, direction),
+                    (interface_name, direction, kind),
                 ).fetchone()
                 summary[direction] = {
                     "episodes": int(row["episodes"] or 0),
@@ -642,3 +667,14 @@ def _observation_dict(row: sqlite3.Row) -> dict:
 
 def _row_dict(row: sqlite3.Row) -> dict:
     return {key: row[key] for key in row.keys()}
+
+
+def _event_dict(row: sqlite3.Row, now: float) -> dict:
+    data = _row_dict(row)
+    end = data.get("ended_at")
+    if end is None and data.get("end_reason") is None and data.get("started_at") is not None:
+        end = now
+    started = data.get("started_at")
+    data["duration_seconds"] = None if started is None or end is None else max(0.0, float(end) - float(started))
+    data["attack_claim"] = "not_confirmed"
+    return data

@@ -55,6 +55,16 @@ class CapacityBody(BaseModel):
         return self
 
 
+class AlertRulesBody(BaseModel):
+    alert_clear_ratio: float | None = Field(default=None, gt=0, lt=1)
+    alert_clear_samples: int | None = Field(default=None, ge=1, le=30)
+    alert_cooldown_seconds: float | None = Field(default=None, ge=0, le=3600)
+    baseline_anomaly_enabled: bool | None = None
+    baseline_multiplier: float | None = Field(default=None, gt=1, le=100)
+    baseline_floor_mbps: float | None = Field(default=None, gt=0, le=1_000_000)
+    baseline_margin_mbps: float | None = Field(default=None, ge=0, le=1_000_000)
+
+
 class ThresholdBody(BaseModel):
     download_threshold_mbps: float | None = Field(default=None, gt=0, le=1_000_000)
     upload_threshold_mbps: float | None = Field(default=None, gt=0, le=1_000_000)
@@ -297,6 +307,35 @@ async def diagnostics(refresh: bool = False) -> dict:
     return await run_in_threadpool(build_diagnostics, monitoring_collector, force=refresh)
 
 
+def _alert_rules() -> dict:
+    config = monitoring_collector.config()
+    samples = int(config.get("alert_clear_samples") or 3)
+    ratio = float(config.get("alert_clear_ratio") or 0.9)
+    cooldown = float(config.get("alert_cooldown_seconds") or 30)
+    return {
+        "enter": "A valid rate at or above the saved threshold starts one episode.",
+        "recover": f"{samples} valid readings in a row below {ratio:.0%} of the threshold.",
+        "clear_ratio": ratio,
+        "clear_samples": samples,
+        "cooldown_seconds": cooldown,
+        "missing_data": "Missing or invalid readings neither start nor end an alert.",
+        "baseline_anomaly_enabled": bool(config.get("baseline_anomaly_enabled")),
+        "baseline_multiplier": config.get("baseline_multiplier"),
+        "baseline_floor_mbps": config.get("baseline_floor_mbps"),
+        "baseline_margin_mbps": config.get("baseline_margin_mbps"),
+        "attack_claim": "Unusual traffic is not a confirmed cyberattack.",
+    }
+
+
+@router.put("/api/alert-rules")
+async def put_alert_rules(body: AlertRulesBody) -> dict:
+    patch = {key: getattr(body, key) for key in body.model_fields_set}
+    if not patch:
+        raise HTTPException(status_code=400, detail="No alert rule fields were provided.")
+    monitoring_collector.update_config(patch)
+    return _alert_rules()
+
+
 @router.get("/api/alerts")
 async def get_alerts(limit: int = Query(default=50, gt=0, le=500)) -> dict:
     name = monitoring_collector.selected_name()
@@ -305,13 +344,21 @@ async def get_alerts(limit: int = Query(default=50, gt=0, le=500)) -> dict:
         "live": monitoring_collector.alert_snapshot(),
         "events": monitoring_collector.store.alert_events(name, limit=limit) if name else [],
         "transitions": monitoring_collector.store.transitions(limit=limit),
-        "rules": {
-            "enter": "A valid rate at or above the saved threshold.",
-            "recover": "3 valid readings in a row below 90% of the threshold.",
-            "cooldown_seconds": 30,
-            "missing_data": "Missing or invalid readings neither start nor end an alert.",
-        },
+        "rules": _alert_rules(),
     }
+
+
+@router.get("/api/reliability")
+async def reliability() -> dict:
+    from starlette.concurrency import run_in_threadpool
+
+    from monitoring.reliability import build_reliability_report
+
+    return await run_in_threadpool(
+        build_reliability_report,
+        monitoring_collector.store,
+        monitoring_collector.selected_name(),
+    )
 
 
 @router.get("/api/forecast")

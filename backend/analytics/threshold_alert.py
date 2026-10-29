@@ -25,6 +25,15 @@ SIDES = ("receive", "transmit")
 LABELS = {"receive": "download", "transmit": "upload"}
 
 
+@dataclass(frozen=True)
+class RecoveryRules:
+    """How an open episode returns to normal. Defaults match the original fixed rule."""
+
+    clear_ratio: float = CLEAR_RATIO
+    clear_samples: int = CLEAR_SAMPLES
+    cooldown_seconds: float = COOLDOWN_SECONDS
+
+
 @dataclass
 class DirectionState:
     active: bool = False
@@ -38,19 +47,19 @@ class DirectionState:
     episodes: int = 0
     event_id: int | None = None
 
-    def snapshot(self, side: str) -> dict:
+    def snapshot(self, side: str, rules: RecoveryRules) -> dict:
         return {
             "direction": side,
             "label": LABELS[side],
             "active": self.active,
             "threshold_mbps": self.threshold_mbps,
-            "clear_below_mbps": None if self.threshold_mbps is None else self.threshold_mbps * CLEAR_RATIO,
+            "clear_below_mbps": None if self.threshold_mbps is None else self.threshold_mbps * rules.clear_ratio,
             "since": self.since,
             "last_alert_at": self.last_alert_at,
             "last_recovery_at": self.last_recovery_at,
             "peak_mbps": self.peak_mbps,
             "latest_mbps": self.latest_mbps,
-            "recovery_progress": f"{self.below_count}/{CLEAR_SAMPLES}" if self.active else None,
+            "recovery_progress": f"{self.below_count}/{rules.clear_samples}" if self.active else None,
             "episodes": self.episodes,
         }
 
@@ -66,7 +75,8 @@ class Transition:
 
 
 class ThresholdAlertTracker:
-    def __init__(self) -> None:
+    def __init__(self, rules: RecoveryRules | None = None) -> None:
+        self.rules = rules or RecoveryRules()
         self.states = {side: DirectionState() for side in SIDES}
 
     def reset(self) -> None:
@@ -78,6 +88,17 @@ class ThresholdAlertTracker:
         state.last_alert_at = last_alert_at
         state.last_recovery_at = last_recovery_at
         state.episodes = episodes
+
+    def resume_open(self, side: str, *, since: float, threshold_mbps: float | None, peak_mbps: float | None) -> None:
+        """Continue an episode that was still open when this process last stopped."""
+        state = self.states[side]
+        state.active = True
+        state.since = since
+        state.last_alert_at = since
+        state.threshold_mbps = threshold_mbps
+        state.peak_mbps = peak_mbps
+        state.below_count = 0
+        state.last_recovery_at = None
 
     def update(self, *, sampled_at: float, valid: bool, values: dict, thresholds: dict) -> list[Transition]:
         transitions: list[Transition] = []
@@ -103,7 +124,7 @@ class ThresholdAlertTracker:
                     state.below_count = 0
                     reopened = (
                         state.last_recovery_at is not None
-                        and sampled_at - state.last_recovery_at < COOLDOWN_SECONDS
+                        and sampled_at - state.last_recovery_at < self.rules.cooldown_seconds
                         and state.since is not None
                     )
                     if reopened:
@@ -120,9 +141,9 @@ class ThresholdAlertTracker:
             if state.peak_mbps is None or value > state.peak_mbps:
                 state.peak_mbps = value
                 transitions.append(Transition(side, "peak", sampled_at, threshold, value, state))
-            if value < threshold * CLEAR_RATIO:
+            if value < threshold * self.rules.clear_ratio:
                 state.below_count += 1
-                if state.below_count >= CLEAR_SAMPLES:
+                if state.below_count >= self.rules.clear_samples:
                     state.active = False
                     state.below_count = 0
                     state.last_recovery_at = sampled_at
@@ -132,7 +153,7 @@ class ThresholdAlertTracker:
         return transitions
 
     def snapshot(self) -> dict:
-        return {side: self.states[side].snapshot(side) for side in SIDES}
+        return {side: self.states[side].snapshot(side, self.rules) for side in SIDES}
 
 
 def explain(side_snapshot: dict) -> str:
@@ -140,7 +161,11 @@ def explain(side_snapshot: dict) -> str:
     threshold = side_snapshot["threshold_mbps"]
     latest = side_snapshot["latest_mbps"]
     latest_text = "no current rate" if latest is None else f"{latest:.2f} Mbps"
+    clear_below = side_snapshot.get("clear_below_mbps")
+    progress = side_snapshot.get("recovery_progress") or ""
+    samples = progress.split("/")[-1] if progress else str(CLEAR_SAMPLES)
+    clear_text = f"{clear_below:.2f}" if clear_below is not None else f"{threshold * CLEAR_RATIO:.2f}"
     return (
         f"{label} reached the {threshold:g} Mbps threshold you saved. The latest reading is {latest_text}. "
-        f"It recovers after {CLEAR_SAMPLES} valid readings below {threshold * CLEAR_RATIO:.2f} Mbps."
+        f"It recovers after {samples} valid readings below {clear_text} Mbps."
     )

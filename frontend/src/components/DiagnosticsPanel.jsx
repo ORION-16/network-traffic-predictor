@@ -10,8 +10,50 @@ const METHOD_NAMES = {
 };
 const HORIZON_NAMES = { 60: "1 min", 300: "5 min", 900: "15 min" };
 
+function ControlledTable({ cases, note }) {
+  if (!cases?.length) return null;
+  return (
+    <div className="overflow-x-auto" id="controlled-forecasts">
+      <table className="w-full min-w-[36rem] text-xs text-slate-300">
+        <caption className="text-left text-slate-200 font-medium pb-1">Fixed series, separate from the live forecast</caption>
+        <thead className="text-slate-500">
+          <tr>
+            <th scope="col" className="text-left font-normal align-bottom px-1 py-1">Series</th>
+            <th scope="col" className="text-right font-normal align-bottom px-1 py-1">Samples</th>
+            <th scope="col" className="text-right font-normal align-bottom px-1 py-1">Horizon</th>
+            <th scope="col" className="text-left font-normal align-bottom px-1 py-1">Lowest MAE</th>
+            <th scope="col" className="text-right font-normal align-bottom px-1 py-1">Quiet n</th>
+            <th scope="col" className="text-right font-normal align-bottom px-1 py-1">Burst n</th>
+          </tr>
+        </thead>
+        <tbody>
+          {cases.map((item) => {
+            const best = item.methods?.[item.best_baseline] || {};
+            return (
+              <tr key={item.name} className="border-t border-slate-800 align-top">
+                <td className="py-1 pr-2">{item.source}</td>
+                <td className="py-1 text-right">{item.samples}</td>
+                <td className="py-1 text-right">{item.horizon_seconds}s</td>
+                <td className="py-1">{item.best_baseline ? `${METHOD_NAMES[item.best_baseline] || item.best_baseline}: MAE ${mbpsMetric(best.mae)} (n=${best.n})` : "n/a"}</td>
+                <td className="py-1 text-right">{best.quiet_n ?? "n/a"}</td>
+                <td className="py-1 text-right">{best.burst_n ?? "n/a"}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="text-xs text-slate-500 mt-1">{note}</p>
+    </div>
+  );
+}
+
 function sentence(text) {
   return text ? text[0].toUpperCase() + text.slice(1) : text;
+}
+
+function countCell(metrics) {
+  if (!metrics || metrics.mae == null) return "n/a";
+  return String(metrics.n ?? 0);
 }
 
 function AccuracyTable({ block, direction }) {
@@ -22,13 +64,14 @@ function AccuracyTable({ block, direction }) {
         <caption className="text-left text-slate-200 font-medium pb-1">{sentence(direction)} walk-forward error (Mbps)</caption>
         <thead className="text-slate-500">
           <tr>
-            <th scope="col" className="text-left font-normal">Horizon</th>
-            <th scope="col" className="text-left font-normal">Method</th>
-            <th scope="col" className="text-right font-normal">MAE</th>
-            <th scope="col" className="text-right font-normal">RMSE</th>
-            <th scope="col" className="text-right font-normal">n</th>
-            <th scope="col" className="text-right font-normal">Quiet MAE (n)</th>
-            <th scope="col" className="text-right font-normal">Burst MAE (n)</th>
+            <th scope="col" className="text-left font-normal align-bottom px-1 py-1">Horizon</th>
+            <th scope="col" className="text-left font-normal align-bottom px-1 py-1">Method</th>
+            <th scope="col" className="text-right font-normal align-bottom px-1 py-1">MAE</th>
+            <th scope="col" className="text-right font-normal align-bottom px-1 py-1">RMSE</th>
+            <th scope="col" className="text-right font-normal align-bottom px-1 py-1">MAPE</th>
+            <th scope="col" className="text-right font-normal align-bottom px-1 py-1">n</th>
+            <th scope="col" className="text-right font-normal align-bottom px-1 py-1">Quiet MAE (n)</th>
+            <th scope="col" className="text-right font-normal align-bottom px-1 py-1">Burst MAE (n)</th>
           </tr>
         </thead>
         <tbody>
@@ -45,9 +88,10 @@ function AccuracyTable({ block, direction }) {
                   <td className={best ? "text-emerald-200" : ""}>{METHOD_NAMES[method]}{best ? " · best" : ""}</td>
                   <td className="text-right">{mbpsMetric(metrics.mae)}</td>
                   <td className="text-right">{mbpsMetric(metrics.rmse)}</td>
-                  <td className="text-right">{metrics.n ?? 0}</td>
-                  <td className="text-right">{mbpsMetric(quiet.mae)} ({quiet.n ?? 0})</td>
-                  <td className="text-right">{mbpsMetric(burst.mae)} ({burst.n ?? 0})</td>
+                  <td className="text-right">{metrics.mape_status === "reported" && metrics.mape != null ? `${metrics.mape.toFixed(1)}%` : "n/a"}</td>
+                  <td className="text-right">{countCell(metrics)}</td>
+                  <td className="text-right">{mbpsMetric(quiet.mae)} ({countCell(quiet)})</td>
+                  <td className="text-right">{mbpsMetric(burst.mae)} ({countCell(burst)})</td>
                 </tr>
               );
             });
@@ -148,13 +192,13 @@ export default function DiagnosticsPanel() {
 
   const quality = report?.data_quality;
   return (
-    <section className="glass-panel rounded-2xl p-4 sm:p-5 space-y-4" id="diagnostics" aria-labelledby="diagnostics-heading">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <h2 id="diagnostics-heading" className="text-base font-semibold text-white">Diagnostics</h2>
-          <p className="text-sm text-slate-400">Walk-forward scores on stored readings from this interface. Each forecast uses only earlier readings.</p>
-        </div>
-        <div className="flex gap-2">
+    <details className="glass-panel rounded-2xl p-4 sm:p-5 space-y-4" id="diagnostics">
+      <summary className="cursor-pointer list-none" id="diagnostics-heading">
+        <span className="text-base font-semibold text-white">Diagnostics</span>
+        <span className="mt-1 block text-sm text-slate-400">Walk-forward scores on stored readings from this interface. Each forecast uses only earlier readings. Open this section to load them.</span>
+      </summary>
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-end pt-3">
+        <div className="flex flex-wrap gap-2">
           <button type="button" className="px-3 py-1.5 rounded-lg bg-indigo-600 text-sm text-white disabled:opacity-60" onClick={() => load(Boolean(report))} disabled={loading}>
             {loading ? "Computing…" : report ? "Refresh" : "Load diagnostics"}
           </button>
@@ -174,6 +218,16 @@ export default function DiagnosticsPanel() {
           </p>
           <AccuracyTable block={report.walk_forward.receive} direction="download" />
           <AccuracyTable block={report.walk_forward.transmit} direction="upload" />
+          <p className="text-xs text-slate-400" id="horizon-reason">
+            5 min: {report.walk_forward.receive["300"]?.reason || `${report.walk_forward.receive["300"]?.methods?.persistence?.n ?? "n/a"} scored origins`}.
+            {" "}15 min: {report.walk_forward.receive["900"]?.reason || `${report.walk_forward.receive["900"]?.methods?.persistence?.n ?? "n/a"} scored origins`}.
+          </p>
+          <ControlledTable cases={report.controlled_forecasts?.cases} note={report.controlled_forecasts?.note} />
+          <p className="text-xs text-slate-300" id="method-comparison">
+            Download, 5 min: quiet traffic best baseline {METHOD_NAMES[report.walk_forward.receive["300"]?.quiet_best_baseline] || "not scored"}; burst targets {METHOD_NAMES[report.walk_forward.receive["300"]?.burst_best_baseline] || "not scored"}.
+            Upload, 5 min: quiet {METHOD_NAMES[report.walk_forward.transmit["300"]?.quiet_best_baseline] || "not scored"}; burst {METHOD_NAMES[report.walk_forward.transmit["300"]?.burst_best_baseline] || "not scored"}.
+            MAPE is shown only when every actual in that score is at least 0.05 Mbps. This table does not claim a reliable advance warning.
+          </p>
           <p className="text-xs text-slate-500">
             Holt is used only if it beats every baseline on both MAE and RMSE. Justified here: download 5 min {report.walk_forward.receive["300"]?.holt_justified ? "yes" : "no"}, upload 5 min {report.walk_forward.transmit["300"]?.holt_justified ? "yes" : "no"}.
             A horizon with n = 0 has no run long enough to score it. {report.walk_forward.parameters.burst_rule}.
@@ -183,6 +237,6 @@ export default function DiagnosticsPanel() {
           <p className="text-xs text-slate-500">{report.advance_warning.note}</p>
         </div>
       )}
-    </section>
+    </details>
   );
 }

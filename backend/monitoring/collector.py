@@ -10,11 +10,13 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import sqlite3
 import threading
 import time
 from pathlib import Path
 
-from analytics.threshold_alert import ThresholdAlertTracker
+from analytics.baseline_anomaly import BaselineAnomalyTracker, BaselineConfig
+from analytics.threshold_alert import RecoveryRules, ThresholdAlertTracker
 from analytics.thresholds import effective_thresholds
 from core.config import settings
 from monitoring.interfaces import default_route_interface, discover_interfaces, preferred_interface_name
@@ -120,8 +122,10 @@ class Collector:
         self._forecast_run: list[dict] | None = None
         self._forecast_run_interface: str | None = None
         self._alerts = ThresholdAlertTracker()
+        self._baseline = BaselineAnomalyTracker()
         self._alerts_interface: str | None = None
         self._alert_event_ids: dict[str, int] = {}
+        self._baseline_event_ids: dict[str, int] = {}
         self._address_signature: tuple[str, int] | None = None
         self._loop_count = 0
 
@@ -214,58 +218,75 @@ class Collector:
 
     def alert_snapshot(self) -> dict:
         name = self.selected_name()
+        rules = self._recovery_rules()
         with self._lock:
             live = self._alerts.snapshot() if self._alerts_interface == name else None
+            baseline = self._baseline.snapshot(rules) if self._alerts_interface == name else None
         history = self.store.alert_history_summary(name) if name else {}
-        return {"interface": name, "live": live, "history": history}
+        return {"interface": name, "live": live, "baseline": baseline, "history": history}
+
+    def _recovery_rules(self) -> RecoveryRules:
+        config = self.store.get_config()
+        return RecoveryRules(
+            clear_ratio=float(config.get("alert_clear_ratio") or 0.9),
+            clear_samples=int(config.get("alert_clear_samples") or 3),
+            cooldown_seconds=float(config.get("alert_cooldown_seconds") or 30),
+        )
+
+    def _baseline_config(self) -> BaselineConfig:
+        config = self.store.get_config()
+        return BaselineConfig(
+            enabled=bool(config.get("baseline_anomaly_enabled")),
+            multiplier=float(config.get("baseline_multiplier") or 3),
+            floor_mbps=float(config.get("baseline_floor_mbps") or 5),
+            margin_mbps=float(config.get("baseline_margin_mbps") or 5),
+        )
 
     def _reset_alerts(self, reason: str) -> None:
         with self._lock:
-            open_ids = dict(self._alert_event_ids)
+            open_ids = list(self._alert_event_ids.values()) + list(self._baseline_event_ids.values())
             self._alert_event_ids = {}
+            self._baseline_event_ids = {}
             self._alerts.reset()
+            self._baseline.reset()
             self._alerts_interface = None
-        for event_id in open_ids.values():
+        for event_id in open_ids:
             self.store.update_alert_event(event_id, end_reason=reason)
 
-    def _apply_alerts(self, name: str, row: dict) -> None:
-        thresholds = self.thresholds(name)
-        with self._lock:
-            if self._alerts_interface != name:
-                self._alerts.reset()
-                self._alert_event_ids = {}
-                self._alerts_interface = name
-                restore = True
-            else:
-                restore = False
-        if restore:
-            summary = self.store.alert_history_summary(name)
-            with self._lock:
-                for side, item in summary.items():
-                    self._alerts.restore(
-                        side,
-                        last_alert_at=item["last_alert_at"],
-                        last_recovery_at=item["last_recovery_at"],
-                        episodes=item["episodes"],
-                    )
-        with self._lock:
-            transitions = self._alerts.update(
-                sampled_at=float(row["sampled_at"]),
-                valid=bool(row.get("valid")) and row.get("quality") == "ok",
-                values={"receive": row.get("rx_mbps"), "transmit": row.get("tx_mbps")},
-                thresholds={"receive": thresholds["receive"], "transmit": thresholds["transmit"]},
+    def _restore_open(self, name: str, kind: str, tracker, event_ids: dict[str, int]) -> None:
+        summary = self.store.alert_history_summary(name, kind)
+        for side, item in summary.items():
+            tracker.restore(
+                side,
+                last_alert_at=item["last_alert_at"],
+                last_recovery_at=item["last_recovery_at"],
+                episodes=item["episodes"],
             )
-            event_ids = dict(self._alert_event_ids)
+        for event in self.store.open_alert_events(name, kind):
+            side = event["direction"]
+            event_ids[side] = int(event["id"])
+            tracker.resume_open(
+                side,
+                since=float(event["started_at"]),
+                **(
+                    {"threshold_mbps": event.get("threshold_mbps"), "peak_mbps": event.get("peak_mbps")}
+                    if kind == "threshold_exceeded"
+                    else {"baseline_mbps": event.get("baseline_mbps"), "peak_mbps": event.get("peak_mbps")}
+                ),
+            )
+
+    def _record_transitions(self, name: str, transitions, event_ids: dict[str, int], kind: str) -> None:
         for change in transitions:
             event_id = event_ids.get(change.side)
             if change.kind == "started":
                 event_ids[change.side] = self.store.insert_alert_event(
                     interface_name=name,
                     direction=change.side,
-                    kind="threshold_exceeded",
+                    kind=kind,
                     started_at=change.at,
-                    threshold_mbps=change.threshold_mbps,
+                    threshold_mbps=change.threshold_mbps if kind == "threshold_exceeded" else None,
                     trigger_mbps=change.value_mbps,
+                    baseline_mbps=change.threshold_mbps if kind == "baseline_anomaly" else None,
                 )
             elif event_id is None:
                 continue
@@ -276,10 +297,51 @@ class Collector:
             elif change.kind == "recovered":
                 self.store.update_alert_event(event_id, ended_at=change.at, end_reason="recovered")
             elif change.kind == "cleared":
-                self.store.update_alert_event(event_id, end_reason="threshold_removed")
+                reason = "threshold_removed" if kind == "threshold_exceeded" else "baseline_disabled"
+                self.store.update_alert_event(event_id, end_reason=reason)
                 event_ids.pop(change.side, None)
+
+    def _apply_alerts(self, name: str, row: dict) -> None:
+        thresholds = self.thresholds(name)
+        rules = self._recovery_rules()
+        with self._lock:
+            self._alerts.rules = rules
+            if self._alerts_interface != name:
+                self._alerts.reset()
+                self._baseline.reset()
+                self._alert_event_ids = {}
+                self._baseline_event_ids = {}
+                self._alerts_interface = name
+                restore = True
+            else:
+                restore = False
+        if restore:
+            self._restore_open(name, "threshold_exceeded", self._alerts, self._alert_event_ids)
+            self._restore_open(name, "baseline_anomaly", self._baseline, self._baseline_event_ids)
+        valid = bool(row.get("valid")) and row.get("quality") == "ok"
+        values = {"receive": row.get("rx_mbps"), "transmit": row.get("tx_mbps")}
+        baseline_config = self._baseline_config()
+        with self._lock:
+            transitions = self._alerts.update(
+                sampled_at=float(row["sampled_at"]),
+                valid=valid,
+                values=values,
+                thresholds={"receive": thresholds["receive"], "transmit": thresholds["transmit"]},
+            )
+            baseline_changes = self._baseline.update(
+                sampled_at=float(row["sampled_at"]),
+                valid=valid,
+                values=values,
+                config=baseline_config,
+                rules=rules,
+            )
+            event_ids = dict(self._alert_event_ids)
+            baseline_ids = dict(self._baseline_event_ids)
+        self._record_transitions(name, transitions, event_ids, "threshold_exceeded")
+        self._record_transitions(name, baseline_changes, baseline_ids, "baseline_anomaly")
         with self._lock:
             self._alert_event_ids = event_ids
+            self._baseline_event_ids = baseline_ids
 
     def _check_network_change(self, name: str) -> None:
         """Re-baseline when the default route moves (auto mode) or this interface's addresses change."""
@@ -421,7 +483,14 @@ class Collector:
             "platform": platform.system(),
             "note": result.note,
         }
-        inserted = self.store.insert_observation(row)
+        try:
+            inserted = self.store.insert_observation(row)
+        except sqlite3.OperationalError as exc:
+            logger.exception("Observation write failed")
+            with self._lock:
+                self._status = "error"
+                self._error = f"SQLite write failed. No zero-traffic row was stored. {exc}"
+            return None
         if inserted:
             try:
                 self._apply_alerts(name, row)

@@ -48,7 +48,8 @@ export default function AlertPanel({ alert, view, latchSince, notificationPermis
       </div>
       <p className="text-sm text-slate-200" id="rise-alert-explanation">{view.explanation}</p>
       <p className="text-xs text-slate-500" id="rise-alert-time">
-        In this state since {latchSince ? new Date(latchSince).toLocaleString() : "unavailable"}. Based on the reading at {formatTimestamp(alert?.sampled_at)}.
+        Panel state since {latchSince ? new Date(latchSince).toLocaleString() : "unavailable"}. Latest reading {formatTimestamp(alert?.sampled_at)}.
+        {events.find((event) => !event.end_reason) ? ` Open episode started ${formatTimestamp(events.find((event) => !event.end_reason).started_at)}.` : ""}
       </p>
 
       {live && (
@@ -74,18 +75,39 @@ export default function AlertPanel({ alert, view, latchSince, notificationPermis
       )}
 
       {events.length > 0 && (
-        <details className="text-xs text-slate-400">
-          <summary className="cursor-pointer text-slate-300">Recent threshold alerts ({events.length})</summary>
-          <ul className="mt-2 space-y-1" id="alert-events">
-            {events.slice(0, 8).map((event) => (
-              <li key={event.id}>
-                {event.direction === "transmit" ? "Upload" : "Download"} reached {event.threshold_mbps} Mbps at {formatTimestamp(event.started_at)}
-                {event.peak_mbps != null ? `, peak ${displayMbps(event.peak_mbps)} Mbps` : ""}
-                {event.end_reason === "recovered" ? `, recovered ${formatTimestamp(event.ended_at)}` : event.end_reason ? `, ended (${event.end_reason.replaceAll("_", " ")})` : ", still active"}
-              </li>
-            ))}
-          </ul>
-        </details>
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs text-slate-300" id="alert-events">
+            <caption className="text-left text-slate-300 pb-1">Recent episodes. None of these confirm a cyberattack.</caption>
+            <thead className="text-slate-500">
+              <tr>
+                <th scope="col" className="text-left font-normal">Type</th>
+                <th scope="col" className="text-left font-normal">Direction</th>
+                <th scope="col" className="text-right font-normal">Rate</th>
+                <th scope="col" className="text-right font-normal">Threshold / baseline</th>
+                <th scope="col" className="text-left font-normal">Started</th>
+                <th scope="col" className="text-right font-normal">Duration</th>
+                <th scope="col" className="text-left font-normal">Ended</th>
+              </tr>
+            </thead>
+            <tbody>
+              {events.slice(0, 8).map((event) => (
+                <tr key={event.id} className="border-t border-slate-800">
+                  <td className="py-1 pr-2">{event.kind === "baseline_anomaly" ? "Baseline anomaly" : "Threshold"}</td>
+                  <td className="py-1 pr-2">{event.direction === "transmit" ? "Upload" : "Download"}</td>
+                  <td className="py-1 pr-2 text-right">{event.trigger_mbps == null ? "n/a" : `${displayMbps(event.trigger_mbps)} Mbps`}</td>
+                  <td className="py-1 pr-2 text-right">
+                    {event.kind === "baseline_anomaly"
+                      ? (event.baseline_mbps == null ? "n/a" : `${displayMbps(event.baseline_mbps)} Mbps baseline`)
+                      : (event.threshold_mbps == null ? "n/a" : `${event.threshold_mbps} Mbps`)}
+                  </td>
+                  <td className="py-1 pr-2">{formatTimestamp(event.started_at)}</td>
+                  <td className="py-1 pr-2 text-right">{event.duration_seconds == null ? "n/a" : `${Math.round(event.duration_seconds)} s`}</td>
+                  <td className="py-1">{event.end_reason === "recovered" ? formatTimestamp(event.ended_at) : event.end_reason ? event.end_reason.replaceAll("_", " ") : "active"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
 
       <p className="text-xs text-slate-500" id="rise-alert-capacity">

@@ -11,6 +11,7 @@ from analytics.rise_alert import (
     merge_advance_reports,
     warning_beats_baselines,
 )
+from analytics.controlled_forecasts import controlled_forecast_report
 from analytics.walk_forward import evaluate_history, split_runs
 from monitoring.collector import Collector
 from monitoring.forecast_log import summarize_forecasts
@@ -83,6 +84,7 @@ def build_diagnostics(collector: Collector, *, force: bool = False) -> dict:
             "longest_run": max((len(run) for run in runs), default=0),
         },
         "walk_forward": walk,
+        "controlled_forecasts": controlled_forecast_report(),
         "advance_warning": {
             "receive": _advance(runs, "rx_mbps", thresholds["receive"], interval),
             "transmit": _advance(runs, "tx_mbps", thresholds["transmit"], interval),

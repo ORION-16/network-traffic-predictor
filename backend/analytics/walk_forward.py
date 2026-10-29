@@ -39,9 +39,20 @@ BURST_RATIO = 3.0
 BURST_MEDIAN_WINDOW = 60
 
 
+def max_join_seconds(sample_interval: float) -> float:
+    """Same gap limit the collector uses before it stores a rate as missing."""
+    return max(5 * sample_interval, 15.0)
+
+
 def split_runs(rows: list[dict], sample_interval: float) -> list[list[dict]]:
-    """Contiguous runs of ok rows with regular spacing."""
-    low, high = 0.5 * sample_interval, 1.5 * sample_interval
+    """Contiguous runs of valid rates.
+
+    A delayed sample is kept when the collector stored it as ok. The run breaks
+    at a baseline, reset, gap, or any spacing longer than the collector's gap
+    limit. Nothing is interpolated.
+    """
+    limit = max_join_seconds(sample_interval)
+    floor = 0.05
     runs: list[list[dict]] = []
     current: list[dict] = []
     previous_at: float | None = None
@@ -49,29 +60,40 @@ def split_runs(rows: list[dict], sample_interval: float) -> list[list[dict]]:
         at = float(row["sampled_at"])
         ok = row.get("quality") == "ok" and row.get("rx_mbps") is not None and row.get("tx_mbps") is not None
         interval = row.get("interval_seconds")
-        regular = interval is not None and low <= float(interval) <= high
-        joined = previous_at is not None and low <= at - previous_at <= high
-        if ok and regular and (joined or not current):
+        spaced = interval is not None and floor <= float(interval) <= limit
+        joined = previous_at is None or floor <= at - previous_at <= limit
+        if ok and spaced and joined:
             current.append(row)
         else:
             if len(current) > 1:
                 runs.append(current)
-            current = [row] if ok and regular else []
+            current = [row] if ok and spaced and (previous_at is None or at - previous_at >= floor) else []
         previous_at = at
     if len(current) > 1:
         runs.append(current)
     return runs
 
 
-def _metrics(errors: list[float]) -> dict:
-    if not errors:
-        return {"n": 0, "mae": None, "rmse": None, "bias": None}
-    n = len(errors)
+MAPE_FLOOR_MBPS = 0.05
+
+
+def _metrics(pairs: list[tuple[float, float]]) -> dict:
+    """pairs are (predicted, actual). MAPE is omitted when any actual is near zero."""
+    if not pairs:
+        return {"n": 0, "mae": None, "rmse": None, "bias": None, "mape": None, "mape_status": "pending"}
+    residuals = [predicted - actual for predicted, actual in pairs]
+    n = len(residuals)
+    mape_ok = all(abs(actual) >= MAPE_FLOOR_MBPS for _, actual in pairs)
+    mape = None
+    if mape_ok:
+        mape = sum(abs(predicted - actual) / abs(actual) for predicted, actual in pairs) / n * 100
     return {
         "n": n,
-        "mae": sum(abs(item) for item in errors) / n,
-        "rmse": math.sqrt(sum(item * item for item in errors) / n),
-        "bias": sum(errors) / n,
+        "mae": sum(abs(item) for item in residuals) / n,
+        "rmse": math.sqrt(sum(item * item for item in residuals) / n),
+        "bias": sum(residuals) / n,
+        "mape": mape,
+        "mape_status": "reported" if mape_ok else "not_reported_near_zero_actuals",
     }
 
 
@@ -108,7 +130,7 @@ def evaluate_runs(
 ) -> dict:
     tolerance = max(0.75 * sample_interval, 0.5)
     steps = horizon_seconds / sample_interval
-    errors: dict[str, dict[str, list[float]]] = {
+    errors: dict[str, dict[str, list[tuple[float, float]]]] = {
         split: {name: [] for name in METHODS} for split in ("all", "quiet", "burst")
     }
     origins = 0
@@ -136,9 +158,9 @@ def evaluate_runs(
                 predicted = forecasts[name][origin]
                 if predicted is None:
                     continue
-                error = predicted - actual
-                errors["all"][name].append(error)
-                errors[split][name].append(error)
+                pair = (predicted, actual)
+                errors["all"][name].append(pair)
+                errors[split][name].append(pair)
     result = {
         "horizon_seconds": horizon_seconds,
         "origins": origins,
@@ -148,13 +170,40 @@ def evaluate_runs(
         "quiet": {name: _metrics(errors["quiet"][name]) for name in METHODS},
         "burst": {name: _metrics(errors["burst"][name]) for name in METHODS},
     }
+    span = max((float(run[-1]["sampled_at"]) - float(run[0]["sampled_at"]) for run in runs if len(run) > 1), default=0.0)
+    result["longest_run_seconds"] = span
+    scored_n = result["methods"]["persistence"]["n"]
+    if scored_n:
+        result["score_status"] = "evaluated"
+        result["reason"] = None
+    elif span < horizon_seconds:
+        result["score_status"] = "insufficient_history"
+        result["reason"] = (
+            f"No {horizon_seconds:.0f}s score. The longest valid run is {span:.0f}s, "
+            "which is shorter than this horizon. The missing score is left blank."
+        )
+    else:
+        result["score_status"] = "insufficient_history"
+        result["reason"] = (
+            "A later sample did not fall close enough to the target time. "
+            "That target was not scored as zero."
+        )
     result["best_by_mae"] = _best(result["methods"])
+    result["best_baseline"] = _best(result["methods"], BASELINES)
+    result["quiet_best_baseline"] = _best(result["quiet"], BASELINES)
+    result["burst_best_baseline"] = _best(result["burst"], BASELINES)
     result["holt_justified"] = holt_justified(result["methods"])
+    result["mape_rule"] = f"MAPE is omitted when any actual in that split is below {MAPE_FLOOR_MBPS} Mbps."
     return result
 
 
-def _best(methods: dict) -> str | None:
-    scored = [(item["mae"], name) for name, item in methods.items() if item["mae"] is not None]
+def _best(methods: dict, names: tuple[str, ...] | None = None) -> str | None:
+    chosen = names or tuple(methods)
+    scored = [
+        (methods[name]["mae"], name)
+        for name in chosen
+        if methods.get(name, {}).get("mae") is not None and methods[name].get("n")
+    ]
     return min(scored)[1] if scored else None
 
 

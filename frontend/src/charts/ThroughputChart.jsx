@@ -83,8 +83,8 @@ function crossingTrace(history, field, threshold, name, color) {
 
 function overlays(history, forecast, thresholds) {
   return [
-    forecastTrace(forecast?.receive, "Download forecast", COLORS.downloadForecast),
-    forecastTrace(forecast?.transmit, "Upload forecast", COLORS.uploadForecast),
+    forecastTrace(forecast?.receive, "Download forecast, not yet observed", COLORS.downloadForecast),
+    forecastTrace(forecast?.transmit, "Upload forecast, not yet observed", COLORS.uploadForecast),
     crossingTrace(history, "rx_mbps", thresholds?.receive, "Download crossed threshold", COLORS.downloadThreshold),
     crossingTrace(history, "tx_mbps", thresholds?.transmit, "Upload crossed threshold", COLORS.uploadThreshold),
   ];
@@ -133,10 +133,20 @@ const TRANSITION_TEXT = {
   network_address_changed: "Network changed",
 };
 
-function buildLayout(forecast, thresholds, transitions, windowStart) {
+const INVALID_TEXT = {
+  gap: "Gap",
+  counter_reset: "Counter reset",
+  interface_changed: "Interface change",
+  baseline: "New baseline",
+  unsupported: "Missing counters",
+};
+
+function buildLayout(forecast, thresholds, transitions, windowStart, history) {
   const { shapes, annotations } = thresholdShapes(thresholds);
   const origin = forecast?.receive?.origin_timestamp || forecast?.transmit?.origin_timestamp;
+  const forecastSeries = forecast?.receive?.series?.length ? forecast.receive.series : forecast?.transmit?.series;
   if (origin && (forecast?.receive?.sufficient || forecast?.transmit?.sufficient)) {
+    const forecastEnd = forecastSeries?.[forecastSeries.length - 1]?.timestamp;
     shapes.push({
       type: "line",
       x0: stamp(origin),
@@ -144,8 +154,49 @@ function buildLayout(forecast, thresholds, transitions, windowStart) {
       yref: "paper",
       y0: 0,
       y1: 1,
-      line: { color: "#64748b", width: 1, dash: "dot" },
+      line: { color: "#e2e8f0", width: 1.5, dash: "dot" },
     });
+    annotations.push({
+      x: stamp(origin),
+      yref: "paper",
+      y: 1,
+      yanchor: "bottom",
+      xanchor: "left",
+      text: "Latest measured",
+      showarrow: false,
+      font: { size: 10, color: "#e2e8f0" },
+    });
+    if (forecastEnd) {
+      shapes.push({
+        type: "rect",
+        x0: stamp(origin),
+        x1: stamp(forecastEnd),
+        yref: "paper",
+        y0: 0,
+        y1: 1,
+        fillcolor: "rgba(103, 232, 249, 0.06)",
+        line: { width: 0 },
+      });
+      shapes.push({
+        type: "line",
+        x0: stamp(forecastEnd),
+        x1: stamp(forecastEnd),
+        yref: "paper",
+        y0: 0,
+        y1: 1,
+        line: { color: "#67e8f9", width: 1, dash: "dash" },
+      });
+      annotations.push({
+        x: stamp(forecastEnd),
+        yref: "paper",
+        y: 1,
+        yanchor: "bottom",
+        xanchor: "right",
+        text: "Forecast ends",
+        showarrow: false,
+        font: { size: 10, color: "#67e8f9" },
+      });
+    }
   }
   let labeledAt = null;
   const ordered = [...(transitions || [])].sort((a, b) => a.at - b.at);
@@ -173,6 +224,36 @@ function buildLayout(forecast, thresholds, transitions, windowStart) {
       showarrow: false,
       font: { size: 10, color: "#6ee7b7" },
     });
+  }
+  let lastInvalid = null;
+  let invalidCount = 0;
+  for (const point of history || []) {
+    const label = INVALID_TEXT[point.quality];
+    if (!label || (windowStart != null && point.sampled_at < windowStart)) continue;
+    if (lastInvalid !== null && point.sampled_at - lastInvalid < 3) continue;
+    if (invalidCount >= 20) break;
+    lastInvalid = point.sampled_at;
+    invalidCount += 1;
+    shapes.push({
+      type: "line",
+      x0: stamp(point.sampled_at),
+      x1: stamp(point.sampled_at),
+      yref: "paper",
+      y0: 0,
+      y1: 1,
+      line: { color: "#fbbf24", width: 1, dash: "dot" },
+    });
+    if (invalidCount <= 6) {
+      annotations.push({
+        x: stamp(point.sampled_at),
+        yref: "paper",
+        y: 0,
+        yanchor: "top",
+        text: label,
+        showarrow: false,
+        font: { size: 9, color: "#fbbf24" },
+      });
+    }
   }
   return {
     autosize: true,
@@ -222,7 +303,7 @@ export default function ThroughputChart({
 
     const bucket = downsampled ? Number(history[history.length - 1]?.interval_seconds) || sampleInterval : sampleInterval;
     const gapSeconds = Math.max(3 * bucket, 5);
-    const layout = buildLayout(forecast, thresholds, transitions, windowStart);
+    const layout = buildLayout(forecast, thresholds, transitions, windowStart, history);
     const overlayTraces = overlays(history, forecast, thresholds);
     const lastAt = history[history.length - 1]?.sampled_at;
     const plotted = plottedRef.current;
@@ -233,8 +314,8 @@ export default function ThroughputChart({
     const drawAll = () => {
       const series = seriesWithGaps(history, gapSeconds);
       const traces = [
-        lineTrace(series.x, series.rx, "Download", COLORS.download),
-        lineTrace(series.x, series.tx, "Upload", COLORS.upload),
+        lineTrace(series.x, series.rx, "Download, measured", COLORS.download),
+        lineTrace(series.x, series.tx, "Upload, measured", COLORS.upload),
         ...overlayTraces,
       ];
       Plotly.react(element, traces, layout, PLOT_CONFIG);
@@ -287,6 +368,9 @@ export default function ThroughputChart({
   return (
     <div id="throughput-chart">
       <div ref={plotRef} style={{ width: "100%", height: "340px" }} role="img" aria-label="Download and upload throughput over time with saved thresholds" />
+      <p className="text-xs text-slate-500 mt-1" id="chart-gap-note">
+        Solid lines are measured throughput. The tinted region starts at the latest measurement; the dashed lines inside it are the forecast and have not been observed. Amber ticks are a baseline, reset, gap, or interface change, and they are not zero traffic.
+      </p>
       {downsampled && (
         <p className="text-xs text-slate-500 mt-1">Long window: each point is the highest reading in its time bucket, so short peaks stay visible.</p>
       )}

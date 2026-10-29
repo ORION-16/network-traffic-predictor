@@ -138,6 +138,19 @@ export async function clearProfileThresholds(name) {
   return resp.json();
 }
 
+export async function saveAlertRules(body) {
+  const resp = await request('/api/alert-rules', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+  return resp.json();
+}
+
+export async function fetchReliability() {
+  const resp = await request('/api/reliability');
+  return resp.json();
+}
+
 export async function fetchDiagnostics(refresh = false) {
   const resp = await request(`/api/diagnostics${refresh ? '?refresh=true' : ''}`);
   return resp.json();

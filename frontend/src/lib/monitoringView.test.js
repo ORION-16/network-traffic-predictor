@@ -243,8 +243,27 @@ test("a forecast above a configured capacity is labeled as a comparison", () => 
     horizonSeconds: 300,
   });
   assert.match(outlook.trend, /above the recent level/);
-  assert.match(outlook.overload, /above the configured/);
+  assert.match(outlook.overload, /above the 2\.00 Mbps threshold/);
   assert.match(outlook.overload, /not measured congestion/);
   assert.match(outlook.accuracy, /walk-forward/);
   assert.match(outlook.accuracy, /waiting for later observations/);
+});
+
+test("a saved direction threshold is the alert line, not an older capacity value", () => {
+  const outlook = trafficOutlook({
+    collection: { freshness: "fresh", status: "running" },
+    current: { quality: "ok", rx_mbps: 1, tx_mbps: 1 },
+    history: [],
+    forecast: {
+      receive: { sufficient: true, point_mbps: 2 },
+      transmit: { sufficient: true, point_mbps: 2 },
+    },
+    capacity: { status: "configured", source: "user", capacity_mbps: 1, direction: "per_direction" },
+    thresholds: { receive: 10, transmit: 10, sources: { receive: "global", transmit: "global" } },
+    evaluation: null,
+    horizonSeconds: 300,
+  });
+  assert.match(outlook.overload, /10\.00 Mbps threshold/);
+  assert.match(outlook.overload, /older capacity value of 1\.00 Mbps/);
+  assert.doesNotMatch(outlook.overload, /above the 1 Mbps/);
 });

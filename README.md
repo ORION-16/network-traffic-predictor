@@ -36,7 +36,7 @@ Mbps = (byte_delta × 8) / elapsed_seconds / 1_000_000
 ```
 
 - **Source.** Stored throughput always comes from `psutil.net_io_counters` for the selected interface. Download is `bytes_recv` and upload is `bytes_sent`. These counters include all frames the OS counts on that adapter, including protocol overhead.
-- **Interval.** The elapsed time is monotonic time between two readings. The sampler runs on a fixed one-second grid, so the time spent on each sample does not add drift. A slot that overruns is skipped rather than sampled twice.
+- **Interval.** The elapsed time is monotonic time between two readings. The sampler runs on a fixed one-second grid, so the time spent on each sample does not add drift. A slot that overruns is skipped rather than sampled twice. A valid reading that arrives a few seconds late stays in the forecast run. A gap longer than 15 seconds starts a new run and is not filled in.
 - **Missing values.** The first reading after a start, an interface change, or a network-address change is a baseline with no rate. A gap longer than max(5 intervals, 15 s), a counter reset, or a missing counter is stored with no rate, never as zero. A stored zero means the counter did not change.
 - **Latest versus average.** "Download" and "Upload" in the overview are the latest one-second rate. The forecast is a smoothed level. Windows longer than 900 points are reduced to clock-aligned buckets that keep each bucket's highest reading, and the chart says so.
 
@@ -61,7 +61,7 @@ This computer's traffic is not the whole business network. `backend/integrations
 
 ## Thresholds and alerts
 
-- **Thresholds.** Download and upload thresholds are numbers you enter for testing. They are not measured capacity, and adapter link speed is never used. The resolution order is a per-interface value, then a global value, then the older single **capacity** value. Zero, negative, non-numeric, and infinite values are rejected. The chart line, `GET /api/thresholds`, and the alert all read the same resolved values.
+- **Thresholds.** Download and upload thresholds are numbers you enter for testing. They are not measured capacity, and adapter link speed is never used. The resolution order is a per-interface value, then a global value, then the older single **capacity** value. Zero, negative, non-numeric, and infinite values are rejected. The chart line, the forecast comparison, and the alert all read the same resolved values. If an older capacity value is still saved and differs, the page names it and does not use it as the alert line.
 - **Threshold exceeded.** Each stored reading is checked on the server, separately for each direction:
   - **Start:** a valid reading at or above the threshold.
   - **Recover:** 3 valid readings in a row below 90% of the threshold.
@@ -70,6 +70,9 @@ This computer's traffic is not the whole business network. `backend/integrations
 
   Episodes are saved in SQLite with the threshold, the triggering value, the peak, and how the episode ended.
 - **Traffic rising** means the latest reading is already well above its recent median: at least 5 Mbps, at least 5 Mbps above the median, and either three times the median or rising from a near-idle median. This is a baseline-relative anomaly flag, applied after the rise starts. It is not a prediction.
+- **Baseline anomaly** is optional and off until you enable it. It compares the latest rate with the median of the previous minute and keeps one episode until the rate falls back. The episode lists the rate, the frozen baseline, the start time, and the duration. It does not mean an attack was confirmed.
+- **Recovery** defaults to 3 valid readings below 90% of the threshold, with a 30-second cooldown that reopens the same episode. Those three numbers can be changed in the dashboard. A backend restart continues an episode that is still open. A failed SQLite write stores nothing and does not invent a zero.
+- **Reliability** measures stored sampling intervals, a temporary-database write probe, retention, process CPU and memory, and fixed counter cases. It does not generate network traffic. Open it from the Reliability section or run `python -m scripts.reliability_report`.
 - **Predicted threshold risk** stays off unless a walk-forward test on stored runs shows the slope rule beating never-warn, persistence, a moving average, and smoothing. It must catch more crossings with no higher false-positive rate, have precision of at least 0.5, and be scored on at least 5 crossings. On the current data it does not pass, so the panel shows "Insufficient evidence for reliable advance warning".
 - **Notifications.** Browser notifications are optional and sent once when an alert begins. The panel remains the alert of record.
 

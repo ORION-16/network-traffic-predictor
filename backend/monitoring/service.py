@@ -361,6 +361,16 @@ def build_dashboard(
             freshness=freshness,
         ),
         "alert_events": collector.store.alert_events(name, limit=20) if name else [],
+        "alert_rules": {
+            "clear_ratio": config.get("alert_clear_ratio"),
+            "clear_samples": config.get("alert_clear_samples"),
+            "cooldown_seconds": config.get("alert_cooldown_seconds"),
+            "baseline_anomaly_enabled": bool(config.get("baseline_anomaly_enabled")),
+            "baseline_multiplier": config.get("baseline_multiplier"),
+            "baseline_floor_mbps": config.get("baseline_floor_mbps"),
+            "baseline_margin_mbps": config.get("baseline_margin_mbps"),
+            "note": "A baseline anomaly compares the latest rate with the recent median. It is not a confirmed cyberattack.",
+        },
         "transitions": collector.store.transitions(start=now - history_seconds, limit=20),
         "profiles": profile_summary(collector, name),
         "evaluation": {

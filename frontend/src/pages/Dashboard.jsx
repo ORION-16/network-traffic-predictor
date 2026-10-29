@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import ErrorAlert from "../components/ErrorAlert";
 import AlertPanel from "../components/AlertPanel";
 import DiagnosticsPanel from "../components/DiagnosticsPanel";
+import ReliabilityPanel from "../components/ReliabilityPanel";
 import ThroughputChart from "../charts/ThroughputChart";
 import { useMonitoring } from "../hooks/useMonitoring";
 import {
@@ -10,6 +11,7 @@ import {
   fetchMonitoringInterfaces,
   saveForecastHorizon,
   saveProfileThresholds,
+  saveAlertRules,
   saveThresholds,
   selectAutoInterface,
   selectMonitoringInterface,
@@ -36,11 +38,121 @@ function parseThreshold(text) {
   return { value };
 }
 
+const METHOD_LABELS = {
+  persistence: "Persistence",
+  moving_average: "Moving average",
+  exponential_smoothing: "Smoothing",
+};
+
+function metricCell(metrics) {
+  if (!metrics || metrics.n == null || metrics.mae == null) return "pending";
+  const mape = metrics.mape_status === "reported" && metrics.mape != null ? `, MAPE ${metrics.mape.toFixed(1)}%` : ", MAPE n/a";
+  return `MAE ${metrics.mae.toFixed(3)}, RMSE ${metrics.rmse.toFixed(3)}${mape} (n=${metrics.n})`;
+}
+
+function ForecastComparison({ evaluation }) {
+  const methods = evaluation?.receive?.methods;
+  if (!methods) return null;
+  return (
+    <div className="overflow-x-auto" id="forecast-comparison">
+      <table className="w-full text-xs text-slate-300">
+        <caption className="text-left text-slate-200 pb-1">Download walk-forward on the current contiguous run. The same history feeds all three methods.</caption>
+        <thead className="text-slate-500">
+          <tr>
+            <th scope="col" className="text-left font-normal">Method</th>
+            <th scope="col" className="text-left font-normal">One-step error</th>
+          </tr>
+        </thead>
+        <tbody>
+          {Object.keys(METHOD_LABELS).map((name) => (
+            <tr key={name} className="border-t border-slate-800">
+              <td className="py-1 pr-3">{METHOD_LABELS[name]}{evaluation.receive.comparison?.lowest_rmse === name ? " · lowest RMSE" : ""}</td>
+              <td>{metricCell(methods[name])}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="text-xs text-slate-500 mt-1">{evaluation.note}</p>
+    </div>
+  );
+}
+
+function AlertRules({ rules, onError }) {
+  const [enabled, setEnabled] = useState(Boolean(rules?.baseline_anomaly_enabled));
+  const [samples, setSamples] = useState(String(rules?.clear_samples ?? 3));
+  const [ratio, setRatio] = useState(String(rules?.clear_ratio ?? 0.9));
+  const [cooldown, setCooldown] = useState(String(rules?.cooldown_seconds ?? 30));
+
+  const signature = rules
+    ? `${rules.clear_samples}|${rules.clear_ratio}|${rules.cooldown_seconds}|${rules.baseline_anomaly_enabled}`
+    : "";
+  useEffect(() => {
+    if (!rules) return;
+    setEnabled(Boolean(rules.baseline_anomaly_enabled));
+    setSamples(String(rules.clear_samples ?? 3));
+    setRatio(String(rules.clear_ratio ?? 0.9));
+    setCooldown(String(rules.cooldown_seconds ?? 30));
+  }, [signature]);
+
+  const save = async (event) => {
+    event.preventDefault();
+    const clearSamples = Number(samples);
+    const clearRatio = Number(ratio);
+    const cooldownSeconds = Number(cooldown);
+    if (!Number.isInteger(clearSamples) || clearSamples < 1 || clearSamples > 30) {
+      onError("Recovery needs 1 to 30 valid readings.");
+      return;
+    }
+    if (!Number.isFinite(clearRatio) || clearRatio <= 0 || clearRatio >= 1) {
+      onError("The recovery ratio must be between 0 and 1.");
+      return;
+    }
+    if (!Number.isFinite(cooldownSeconds) || cooldownSeconds < 0 || cooldownSeconds > 3600) {
+      onError("Cooldown must be from 0 to 3600 seconds.");
+      return;
+    }
+    try {
+      await saveAlertRules({
+        alert_clear_samples: clearSamples,
+        alert_clear_ratio: clearRatio,
+        alert_cooldown_seconds: cooldownSeconds,
+        baseline_anomaly_enabled: enabled,
+      });
+      onError(null);
+    } catch (err) {
+      onError(err.message || "Could not save alert rules");
+    }
+  };
+
+  return (
+    <form onSubmit={save} className="text-xs text-slate-400 space-y-2" id="alert-rules">
+      <p className="text-slate-300">Recovery and baseline anomaly</p>
+      <div className="grid grid-cols-3 gap-2">
+        <label>Readings to recover
+          <input className="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1" value={samples} onChange={(event) => setSamples(event.target.value)} aria-label="Readings to recover" />
+        </label>
+        <label>Clear ratio
+          <input className="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1" value={ratio} onChange={(event) => setRatio(event.target.value)} aria-label="Clear ratio" />
+        </label>
+        <label>Cooldown (s)
+          <input className="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1" value={cooldown} onChange={(event) => setCooldown(event.target.value)} aria-label="Cooldown seconds" />
+        </label>
+      </div>
+      <label className="flex items-center gap-2">
+        <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />
+        Flag traffic that is already high versus the recent median. This is not a confirmed cyberattack.
+      </label>
+      <button type="submit" className="px-3 py-1.5 rounded-lg border border-slate-700 text-slate-200">Save alert rules</button>
+      <p>{rules?.note}</p>
+    </form>
+  );
+}
+
 function Stat({ label, value, id, tone = "text-white" }) {
   return (
-    <div className="min-w-0">
-      <dt className="text-xs text-slate-500">{label}</dt>
-      <dd className={`text-sm font-medium truncate ${tone}`} id={id} title={typeof value === "string" ? value : undefined}>{value}</dd>
+    <div className="min-w-0 rounded-xl border border-slate-800 bg-slate-950/70 px-3 py-3">
+      <dt className="text-[11px] uppercase tracking-wide text-slate-500">{label}</dt>
+      <dd className={`mt-1 text-sm font-semibold truncate ${tone}`} id={id} title={typeof value === "string" ? value : undefined}>{value}</dd>
     </div>
   );
 }
@@ -107,6 +219,7 @@ export default function Dashboard() {
     history: data?.history,
     forecast: data?.forecast,
     capacity: data?.capacity,
+    thresholds,
     evaluation: data?.evaluation,
     ledger: data?.forecast_ledger,
     horizonSeconds: horizon,
@@ -190,10 +303,11 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-[#070b14] text-slate-100">
-      <header className="border-b border-slate-800/80 bg-slate-950/70">
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-2">
+      <header className="border-b border-slate-800/80 bg-slate-950/80">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 py-5 flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
           <div>
-            <h1 className="text-lg font-semibold text-white">Network traffic</h1>
+            <p className="text-[11px] uppercase tracking-[0.16em] text-cyan-300/80">Local interface</p>
+            <h1 className="text-xl font-semibold text-white">Network traffic</h1>
             <p className="text-sm text-slate-400">One interface on this computer. Not the router or other devices on the network.</p>
           </div>
           <p className="text-xs text-slate-500" aria-live="polite">
@@ -207,7 +321,7 @@ export default function Dashboard() {
         <ErrorAlert error={statusError} onDismiss={() => setActionError(null)} />
 
         <section className="glass-panel rounded-2xl p-4 sm:p-5" id="overview" aria-label="Overview">
-          <dl className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+          <dl className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <Stat label="Collector" value={`${collection?.status || "unavailable"} · ${collection?.freshness || "no data"}`} id="overview-health" tone={freshnessTone} />
             <Stat label="Source" value={collection?.source || "unavailable"} id="overview-source" />
             <Stat label="Interface" value={selected ? `${selected}${selectedRecord?.kind ? ` · ${selectedRecord.kind}` : ""}` : "none"} id="overview-interface" />
@@ -295,6 +409,7 @@ export default function Dashboard() {
           )}
           <p className="text-sm text-slate-300" id="overload-summary">{outlook.overload}</p>
           <p className="text-xs text-slate-500" id="accuracy-summary">{outlook.accuracy}</p>
+          <ForecastComparison evaluation={data?.evaluation} />
         </section>
 
         <section className="glass-panel rounded-2xl p-4 sm:p-5 space-y-4" id="settings" aria-labelledby="settings-heading">
@@ -361,10 +476,15 @@ export default function Dashboard() {
               <p className="text-xs text-slate-500" id="threshold-help">
                 Current: download {thresholds?.receive != null ? `${thresholds.receive} Mbps (${SOURCE_TEXT[thresholds.sources?.receive]})` : "not set"},
                 upload {thresholds?.transmit != null ? `${thresholds.transmit} Mbps (${SOURCE_TEXT[thresholds.sources?.transmit]})` : "not set"}.
-                These are test values you choose, not measured internet capacity, and adapter link speed is never used. {savedNote}
+                These are the values drawn on the chart and used by alerts. They are not measured internet capacity, and adapter link speed is never used.
+                {data?.capacity?.status === "configured" && data.capacity.capacity_mbps != null && (thresholds?.receive !== data.capacity.capacity_mbps || thresholds?.transmit !== data.capacity.capacity_mbps)
+                  ? ` An older capacity value of ${data.capacity.capacity_mbps} Mbps is still saved and is not the alert line.`
+                  : ""}
+                {" "}{savedNote}
               </p>
             </form>
           </div>
+          <AlertRules rules={data?.alert_rules} onError={setActionError} />
           {data?.profiles?.items?.length > 1 && (
             <details className="text-xs text-slate-400">
               <summary className="cursor-pointer text-slate-300">Interface profiles ({data.profiles.items.length})</summary>
@@ -381,6 +501,7 @@ export default function Dashboard() {
           )}
         </section>
 
+        <ReliabilityPanel />
         <DiagnosticsPanel />
       </main>
     </div>

@@ -230,7 +230,7 @@ export function ledgerAccuracy(ledger, minutes) {
   return text;
 }
 
-export function trafficOutlook({ collection, current, history, forecast, capacity, evaluation, ledger, horizonSeconds }) {
+export function trafficOutlook({ collection, current, history, forecast, capacity, thresholds, evaluation, ledger, horizonSeconds }) {
   const minutes = Math.max(1, Math.round(Number(horizonSeconds) / 60));
   const freshness = collection?.freshness;
   const currentEnough = freshness === "fresh" && current?.quality === "ok";
@@ -265,26 +265,31 @@ export function trafficOutlook({ collection, current, history, forecast, capacit
     trend += " The line is a smoothed level held flat. It does not name a future spike or peak time, and it is only this computer.";
   }
 
-  const configured = capacity?.status === "configured" && capacity?.source === "user" && finite(capacity.capacity_mbps) > 0;
+  const legacy = capacity?.status === "configured" && capacity?.source === "user" ? finite(capacity.capacity_mbps) : null;
+  const downloadLimit = finite(thresholds?.receive) ?? (capacity?.direction === "transmit_only" ? null : legacy);
+  const uploadLimit = finite(thresholds?.transmit) ?? (capacity?.direction === "receive_only" ? null : legacy);
+  const configured = downloadLimit !== null || uploadLimit !== null;
   let overload = "Overload risk cannot yet be determined.";
   if (!forecastReady || freshness !== "fresh") {
     overload = "Overload risk cannot yet be determined. The forecast is not current or does not have enough history.";
   } else if (!configured) {
-    overload = "Overload risk cannot yet be determined. No bottleneck capacity has been entered. Adapter link speed is not used.";
+    overload = "Overload risk cannot yet be determined. No threshold has been entered. Adapter link speed is not used.";
   } else {
-    const cap = finite(capacity.capacity_mbps);
     const pairs = [];
-    if (capacity.direction !== "transmit_only") pairs.push(["Download", receiveForecast]);
-    if (capacity.direction !== "receive_only") pairs.push(["Upload", transmitForecast]);
-    const worst = pairs.reduce((best, item) => (item[1] > best[1] ? item : best), pairs[0]);
-    const pct = (worst[1] / cap) * 100;
-    const warning = finite(capacity.warning_utilization_pct);
+    if (downloadLimit !== null) pairs.push(["Download", receiveForecast, downloadLimit]);
+    if (uploadLimit !== null) pairs.push(["Upload", transmitForecast, uploadLimit]);
+    const worst = pairs.reduce((best, item) => (item[1] / item[2] > best[1] / best[2] ? item : best), pairs[0]);
+    const pct = (worst[1] / worst[2]) * 100;
+    const warning = finite(capacity?.warning_utilization_pct);
     if (pct >= 100) {
-      overload = `${worst[0]} forecast ${displayMbps(worst[1])} Mbps is above the configured ${displayMbps(cap)} Mbps. That is a comparison with the number you entered, not measured congestion.`;
+      overload = `${worst[0]} forecast ${displayMbps(worst[1])} Mbps is above the ${displayMbps(worst[2])} Mbps threshold used by the chart and the alert. That is a comparison with the number you entered, not measured congestion.`;
     } else if (warning !== null && pct >= warning) {
-      overload = `${worst[0]} forecast is ${pct.toFixed(0)}% of the configured ${displayMbps(cap)} Mbps, at or above the warning mark of ${warning}%. This is not measured congestion.`;
+      overload = `${worst[0]} forecast is ${pct.toFixed(0)}% of the ${displayMbps(worst[2])} Mbps threshold, at or above the warning mark of ${warning}%. This is not measured congestion.`;
     } else {
-      overload = `Forecast demand stays below the configured ${displayMbps(cap)} Mbps. This is only this computer, and it is not a congestion finding.`;
+      overload = `The forecast stays below the ${displayMbps(worst[2])} Mbps threshold used by the chart and the alert. This is only this computer, and it is not a congestion finding.`;
+    }
+    if (legacy !== null && ((downloadLimit !== null && downloadLimit !== legacy) || (uploadLimit !== null && uploadLimit !== legacy))) {
+      overload += ` An older capacity value of ${displayMbps(legacy)} Mbps is saved and is not the alert line.`;
     }
   }
 

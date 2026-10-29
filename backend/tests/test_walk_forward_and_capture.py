@@ -29,6 +29,35 @@ def _rows(values: list[float], *, start: float = 1_000.0, interval: float = 1.0,
     ]
 
 
+def test_a_delayed_valid_sample_stays_in_the_run_and_a_long_gap_does_not():
+    rows = []
+    clock = 1_000.0
+    for index in range(420):
+        gap = 6.0 if index in {40, 80, 120} else 1.0
+        clock += gap
+        rows.append(
+            {
+                "sampled_at": clock,
+                "interval_seconds": gap,
+                "quality": "ok",
+                "rx_mbps": 1.0,
+                "tx_mbps": 0.2,
+            }
+        )
+    rows.append({"sampled_at": clock + 35, "interval_seconds": 35, "quality": "gap", "rx_mbps": None, "tx_mbps": None})
+    rows.extend(_rows([1.0] * 30, start=clock + 36))
+    runs = split_runs(rows, 1.0)
+    assert len(runs) == 2
+    scored = evaluate_runs(runs[:1], "rx_mbps", horizon_seconds=300, sample_interval=1.0)
+    assert scored["methods"]["persistence"]["n"] > 0
+    assert scored["score_status"] == "evaluated"
+    short = evaluate_runs(runs[:1], "rx_mbps", horizon_seconds=900, sample_interval=1.0)
+    assert short["methods"]["persistence"]["n"] == 0
+    assert short["methods"]["persistence"]["mae"] is None
+    assert short["score_status"] == "insufficient_history"
+    assert "left blank" in short["reason"]
+
+
 def test_runs_split_at_gaps_and_invalid_rows():
     rows = _rows([0.2] * 30) + _rows([0.2] * 30, start=1_100.0)
     rows.insert(10, {"sampled_at": 1_010.5, "interval_seconds": None, "quality": "baseline", "rx_mbps": None, "tx_mbps": None})
